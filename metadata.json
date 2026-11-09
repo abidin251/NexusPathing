@@ -1,0 +1,6 @@
+{
+  "name": "NexusPathing // Blish HUD Pathing to Raidcore Nexus Port",
+  "description": "Complete C++20 DirectX 11 Raidcore Nexus Addon port of the Blish HUD Pathing module with live 3D simulation, .taco/.trl parser, Lua VM sandbox, and downloadable CMake source.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

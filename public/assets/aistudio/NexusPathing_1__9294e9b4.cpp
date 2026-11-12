@@ -227,6 +227,7 @@ struct RuntimeMarker {
     bool        ScriptAutoTriggered = false;
     bool        IsFocused           = false;
     bool        IsVisible           = true;
+    bool        FromLua             = false;   // created by Pack:CreateMarker; purged before pack.lua re-runs
 };
 
 struct RuntimeTrail {
@@ -1498,6 +1499,78 @@ static void PushLuaLog(const std::string& msg, ELogLevel level = LOGL_INFO) {
     }
 }
 
+// ============================================================================
+// Lua hardening helpers (safe error strings, text-only loading, budgeted calls)
+// ============================================================================
+
+// lua_tostring() returns NULL for non-string errors (error({}), error(nil)); `std::string + NULL` is UB.
+static std::string LuaErrStr(lua_State* L, int idx = -1) {
+    if (!L) return "<no lua state>";
+    if (const char* s = lua_tostring(L, idx)) return s;
+    return std::string("<non-string error: ") + luaL_typename(L, idx) + ">";
+}
+
+// luaL_loadbuffer() does NOT skip a UTF-8 BOM (only luaL_loadfile does). Scripts saved by Windows editors
+// inside .taco archives start with one and fail with "unexpected symbol near '<\239>'".
+// Load as TEXT ONLY (mode "t") so a hostile pack cannot smuggle precompiled bytecode into the VM.
+static int LuaLoadText(lua_State* L, const std::string& code, const std::string& chunkName) {
+    size_t off = 0;
+    if (code.size() >= 3 && static_cast<unsigned char>(code[0]) == 0xEF &&
+        static_cast<unsigned char>(code[1]) == 0xBB && static_cast<unsigned char>(code[2]) == 0xBF) {
+        off = 3;
+    }
+    const std::string name = "=" + chunkName;   // '=' => shown verbatim in error messages
+    return luaL_loadbufferx(L, code.data() + off, code.size() - off, name.c_str(), "t");
+}
+
+// Instruction budget so a runaway `while true do end` in a pack script cannot freeze the render thread.
+static constexpr int LUA_HOOK_STEP          = 10000;
+static constexpr int LUA_INSTRUCTION_BUDGET = 20000000;   // per top-level call; raise if a big pack.lua needs more
+static int           g_LuaHookCounter       = 0;
+static int           g_LuaCallDepth         = 0;
+
+static void LuaBudgetHook(lua_State* L, lua_Debug*) {
+    g_LuaHookCounter += LUA_HOOK_STEP;
+    if (g_LuaHookCounter > LUA_INSTRUCTION_BUDGET) {
+        g_LuaHookCounter = 0;
+        luaL_error(L, "script exceeded instruction budget (possible infinite loop)");
+    }
+}
+
+static int LuaMsgHandler(lua_State* L) {
+    const char* msg = lua_tostring(L, 1);
+    if (!msg) {
+        // keep non-string error objects intact; just describe them
+        msg = lua_pushfstring(L, "(error object is a %s value)", luaL_typename(L, 1));
+    }
+    luaL_traceback(L, L, msg, 1);
+    return 1;
+}
+
+// Drop-in replacement for lua_pcall() with traceback + instruction budget. Same stack contract as lua_pcall.
+static int LuaSafeCall(lua_State* L, int nargs, int nresults) {
+    const int base = lua_gettop(L) - nargs;
+    lua_pushcfunction(L, LuaMsgHandler);
+    lua_insert(L, base);
+    if (g_LuaCallDepth == 0) g_LuaHookCounter = 0;
+    ++g_LuaCallDepth;
+    const int rc = lua_pcall(L, nargs, nresults, base);
+    --g_LuaCallDepth;
+    lua_remove(L, base);
+    return rc;
+}
+
+// Throttle repeated per-frame error spam (a failing Event:OnTick would otherwise log 144x/second).
+static void PushLuaLogThrottled(const std::string& msg, ELogLevel level = LOGL_WARNING) {
+    static uint64_t s_LastLog = 0;
+    static std::string s_LastMsg;
+    const uint64_t now = GetTickCount64();
+    if (msg == s_LastMsg && now - s_LastLog < 5000) return;
+    s_LastMsg = msg;
+    s_LastLog = now;
+    PushLuaLog(msg, level);
+}
+
 // Forward declarations for texture & category helpers used by Lua bindings
 using ArchiveFileFetcher = std::function<bool(const std::string& relPath, std::vector<uint8_t>& outBytes)>;
 static std::string EnsurePackTextureLoaded(
@@ -1549,6 +1622,10 @@ static int Lua_DebugPrint(lua_State* L) {
 static int Lua_EventOnTick(lua_State* L) {
     int funcIdx = lua_isfunction(L, 1) ? 1 : (lua_isfunction(L, 2) ? 2 : 0);
     if (funcIdx != 0) {
+        if (g_LuaTickRefs.size() >= 256) {            // runaway registration guard (e.g. Event:OnTick inside a loop)
+            PushLuaLogThrottled("Event:OnTick: too many handlers registered (limit 256); ignoring");
+            return 0;
+        }
         lua_pushvalue(L, funcIdx);
         int ref = luaL_ref(L, LUA_REGISTRYINDEX);
         g_LuaTickRefs.push_back(ref);
@@ -1673,38 +1750,80 @@ static int Lua_ITexture(lua_State* L) {
 }
 
 static int Lua_Require(lua_State* L) {
-    const char* name = luaL_checkstring(L, 1);
-    if (!name) return 0;
-    std::string key = NormalizeArchivePath(name);
+    // NOTE: luaL_checkstring may longjmp, so it runs before any std::string exists in this frame.
+    const char* nameC = luaL_checkstring(L, 1);
+
+    std::string key = NormalizeArchivePath(nameC);
     if (key.size() < 4 || key.substr(key.size() - 4) != ".lua") {
+        // Lua-style dotted module names ("lib.helpers" -> "lib/helpers.lua")
+        if (key.find('/') == std::string::npos) std::replace(key.begin(), key.end(), '.', '/');
         key += ".lua";
     }
 
+    // Resolve: exact path, then unique basename match (packs are inconsistent about folders).
     auto it = g_LuaScriptsInPack.find(key);
     if (it == g_LuaScriptsInPack.end()) {
-        std::string baseName = std::filesystem::path(key).filename().string();
-        for (const auto& [k, code] : g_LuaScriptsInPack) {
-            if (std::filesystem::path(k).filename().string() == baseName) {
-                it = g_LuaScriptsInPack.find(k);
-                break;
-            }
+        const std::string baseName = std::filesystem::path(key).filename().string();
+        for (auto cur = g_LuaScriptsInPack.begin(); cur != g_LuaScriptsInPack.end(); ++cur) {
+            if (std::filesystem::path(cur->first).filename().string() == baseName) { it = cur; break; }
         }
     }
+    if (it == g_LuaScriptsInPack.end()) {
+        PushLuaLog("Lua require: module not found in pack: " + key, LOGL_WARNING);
+        return 0;
+    }
+    const std::string resolved = it->first;
 
-    if (it != g_LuaScriptsInPack.end()) {
-        if (luaL_loadbuffer(L, it->second.data(), it->second.size(), key.c_str()) == LUA_OK) {
-            if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
-                return 1;
-            } else {
-                PushLuaLog(std::string("Lua require runtime error: ") + lua_tostring(L, -1), LOGL_WARNING);
-                lua_pop(L, 1);
-            }
-        } else {
-            PushLuaLog(std::string("Lua require syntax error: ") + lua_tostring(L, -1), LOGL_WARNING);
-            lua_pop(L, 1);
-        }
+    // package.loaded-style cache in the registry: a module runs ONCE per VM (the old code re-ran it on every
+    // require(), duplicating Event:OnTick handlers, menus and markers). A lightuserdata sentinel marks
+    // "currently loading" so circular requires fail cleanly instead of recursing until the C stack dies.
+    static char s_LoadingSentinel;
+    lua_getfield(L, LUA_REGISTRYINDEX, "NexusPathing.loaded");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "NexusPathing.loaded");
     }
-    return 0;
+    const int cacheIdx = lua_gettop(L);
+
+    lua_getfield(L, cacheIdx, resolved.c_str());
+    if (lua_touserdata(L, -1) == &s_LoadingSentinel) {
+        lua_settop(L, cacheIdx - 1);
+        PushLuaLog("Lua require: circular dependency on " + resolved, LOGL_WARNING);
+        return 0;
+    }
+    if (!lua_isnil(L, -1)) {            // cache hit
+        lua_remove(L, cacheIdx);        // drop cache table, keep module value
+        return 1;
+    }
+    lua_pop(L, 1);
+
+    lua_pushlightuserdata(L, &s_LoadingSentinel);
+    lua_setfield(L, cacheIdx, resolved.c_str());
+
+    if (LuaLoadText(L, it->second, resolved) != LUA_OK) {
+        PushLuaLog("Lua require syntax error: " + LuaErrStr(L), LOGL_WARNING);
+        lua_settop(L, cacheIdx);
+        lua_pushnil(L);
+        lua_setfield(L, cacheIdx, resolved.c_str());
+        lua_settop(L, cacheIdx - 1);
+        return 0;
+    }
+    if (LuaSafeCall(L, 0, 1) != LUA_OK) {
+        PushLuaLog("Lua require runtime error: " + LuaErrStr(L), LOGL_WARNING);
+        lua_settop(L, cacheIdx);
+        lua_pushnil(L);
+        lua_setfield(L, cacheIdx, resolved.c_str());
+        lua_settop(L, cacheIdx - 1);
+        return 0;
+    }
+    // stack: cache, result
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_pushboolean(L, 1); }   // modules returning nothing => true
+    lua_pushvalue(L, -1);
+    lua_setfield(L, cacheIdx, resolved.c_str());
+    lua_remove(L, cacheIdx);
+    return 1;
 }
 
 static int Lua_NoOpReturnSelf(lua_State* L) {
@@ -2306,11 +2425,14 @@ static int Lua_Pack_Require(lua_State* L) {
     return Lua_Require(L);
 }
 
+static uint64_t g_LuaMarkerSeq = 0;   // reset together with the VM so re-running pack.lua yields the same GUIDs
+
 static int Lua_Pack_CreateMarker(lua_State* L) {
     int attrIdx = lua_istable(L, 2) ? 2 : (lua_istable(L, 1) ? 1 : 0);
     RuntimeMarker m{};
     m.PackName = g_CurrentPackName;
-    m.Guid = "lua_marker_" + std::to_string(g_Markers.size());
+    m.FromLua = true;
+    m.Guid = "lua_marker_" + std::to_string(g_LuaMarkerSeq++);
     if (g_Mumble) {
         m.MapId = static_cast<int32_t>(g_Mumble->Context.MapID);
         m.Position = { g_Mumble->AvatarPosition.X, g_Mumble->AvatarPosition.Y, g_Mumble->AvatarPosition.Z };
@@ -2442,11 +2564,12 @@ static std::unordered_map<std::string, std::string> g_LuaStorageKV;
 
 static int Lua_Storage_ReadValue(lua_State* L) {
     int startIdx = lua_istable(L, 1) ? 2 : 1;
-    std::string ns  = luaL_optstring(L, startIdx, "");
-    std::string key = luaL_optstring(L, startIdx + 1, "");
-    auto it = g_LuaStorageKV.find(ns + ":" + key);
+    // Fetch ALL C strings first: luaL_optstring can longjmp, which would skip destructors of live std::strings.
+    const char* nsC  = luaL_optstring(L, startIdx, "");
+    const char* keyC = luaL_optstring(L, startIdx + 1, "");
+    auto it = g_LuaStorageKV.find(std::string(nsC) + ":" + keyC);
     if (it != g_LuaStorageKV.end()) {
-        lua_pushstring(L, it->second.c_str());
+        lua_pushlstring(L, it->second.data(), it->second.size());
     } else {
         lua_pushnil(L);
     }
@@ -2455,11 +2578,21 @@ static int Lua_Storage_ReadValue(lua_State* L) {
 
 static int Lua_Storage_UpsertValue(lua_State* L) {
     int startIdx = lua_istable(L, 1) ? 2 : 1;
-    std::string ns  = luaL_optstring(L, startIdx, "");
-    std::string key = luaL_optstring(L, startIdx + 1, "");
-    std::string val = luaL_optstring(L, startIdx + 2, "");
-    g_LuaStorageKV[ns + ":" + key] = val;
-    SaveConfigToDisk();
+    const char* nsC  = luaL_optstring(L, startIdx, "");
+    const char* keyC = luaL_optstring(L, startIdx + 1, "");
+    size_t valLen = 0;
+    const char* valC = luaL_optlstring(L, startIdx + 2, "", &valLen);
+
+    constexpr size_t kMaxValueBytes = 64 * 1024;
+    constexpr size_t kMaxEntries    = 2048;
+    std::string fullKey = std::string(nsC) + ":" + keyC;
+    if (valLen > kMaxValueBytes || (g_LuaStorageKV.size() >= kMaxEntries && !g_LuaStorageKV.count(fullKey))) {
+        PushLuaLogThrottled("Storage:UpsertValue rejected (value > 64 KB or more than 2048 keys)");
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    g_LuaStorageKV[fullKey].assign(valC, valLen);
+    g_PendingSaveConfigOnMainThread.store(true);   // coalesced; was a synchronous disk write on every call
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -2484,8 +2617,50 @@ static void InitLuaVM() {
     }
     g_LuaTickRefs.clear();
 
+    g_LuaMarkerSeq   = 0;
+    g_LuaHookCounter = 0;
+    g_LuaCallDepth   = 0;
+
     g_Lua = luaL_newstate();
+    if (!g_Lua) {
+        PushLuaLog("luaL_newstate failed (out of memory)", LOGL_CRITICAL);
+        return;
+    }
+#ifndef NP_LUA_UNSANDBOXED
+    // Packs are untrusted downloads: do NOT expose io / os / debug / package / dofile / loadfile.
+    {
+        static const luaL_Reg kSafeLibs[] = {
+            { LUA_GNAME,      luaopen_base },
+            { LUA_COLIBNAME,  luaopen_coroutine },
+            { LUA_TABLIBNAME, luaopen_table },
+            { LUA_STRLIBNAME, luaopen_string },
+            { LUA_MATHLIBNAME,luaopen_math },
+            { LUA_UTF8LIBNAME,luaopen_utf8 },
+            { LUA_OSLIBNAME,  luaopen_os },      // trimmed below to time/clock/date/difftime
+            { nullptr, nullptr }
+        };
+        for (const luaL_Reg* lib = kSafeLibs; lib->func; ++lib) {
+            luaL_requiref(g_Lua, lib->name, lib->func, 1);
+            lua_pop(g_Lua, 1);
+        }
+    }
+    if (luaL_dostring(g_Lua, R"(
+        dofile, loadfile = nil, nil
+        for _, k in ipairs({"execute","exit","remove","rename","tmpname","getenv","setlocale"}) do os[k] = nil end
+        -- force text-only chunks (no precompiled bytecode) while keeping the standard signature
+        local _load = load
+        load = function(chunk, name, mode, ...) return _load(chunk, name, "t", ...) end
+        -- some Blish scripts probe package.loaded; give them a harmless stub
+        package = { loaded = {}, path = "", cpath = "" }
+    )") != LUA_OK) {
+        PushLuaLog("Lua sandbox prelude failed: " + LuaErrStr(g_Lua), LOGL_WARNING);
+        lua_pop(g_Lua, 1);
+    }
+#else
     luaL_openlibs(g_Lua);
+#endif
+    lua_gc(g_Lua, LUA_GCGEN, 0, 0);   // generational GC (stable in 5.4.7): cheap minor collections for per-frame temp tables
+    lua_sethook(g_Lua, LuaBudgetHook, LUA_MASKCOUNT, LUA_HOOK_STEP);
 
     // Global PathingVersion & Pathing object (required by xrandox_TehsTrails.taco & Blish HUD scripts!)
     lua_pushstring(g_Lua, "1.13.2");
@@ -2502,7 +2677,7 @@ static void InitLuaVM() {
 
     // Add real recursive table.ToLson, table.FromLson, and string:ToBase64() so both `marker.Guid .. "text"`
     // and `trail.Guid:ToBase64()` work natively in Lua 5.4!
-    luaL_dostring(g_Lua, R"(
+    if (luaL_dostring(g_Lua, R"(
         if string then
             string.ToBase64 = function(self) return self end
         end
@@ -2536,7 +2711,10 @@ static void InitLuaVM() {
                 return {}
             end
         end
-    )");
+    )") != LUA_OK) {
+        PushLuaLog("Lua prelude failed: " + LuaErrStr(g_Lua), LOGL_WARNING);
+        lua_pop(g_Lua, 1);
+    }
 
     // Override print and require
     lua_pushcfunction(g_Lua, Lua_DebugPrint);
@@ -2747,8 +2925,8 @@ static void InvokeMarkerLuaScript(
         }
     }
 
-    if (lua_pcall(g_Lua, nargs, 0, 0) != LUA_OK) {
-        PushLuaLog(std::string("Marker script error (") + fnName + "): " + lua_tostring(g_Lua, -1), LOGL_WARNING);
+    if (LuaSafeCall(g_Lua, nargs, 0) != LUA_OK) {
+        PushLuaLogThrottled("Marker script error (" + fnName + "): " + LuaErrStr(g_Lua));
         lua_pop(g_Lua, 1);
     }
 }
@@ -2847,29 +3025,35 @@ static void UpdateLuaMumbleGlobals(double totalSeconds, double deltaSeconds) {
     }
     lua_pop(g_Lua, 1);
 
-    // Execute registered Event:OnTick(gameTime) listeners with Blish HUD GameTime structure
-    for (int ref : g_LuaTickRefs) {
-        lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, ref);
-        if (lua_isfunction(g_Lua, -1)) {
-            lua_newtable(g_Lua);
+    // Execute registered Event:OnTick(gameTime) listeners with Blish HUD GameTime structure.
+    // Index loop + by-value ref: a handler may call Event:OnTick(...) and push_back into g_LuaTickRefs,
+    // which invalidated the iterators of the previous range-for (undefined behaviour).
+    if (!g_LuaTickRefs.empty()) {
+        lua_newtable(g_Lua);
+        lua_newtable(g_Lua);
+        lua_pushnumber(g_Lua, totalSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
+        lua_pushnumber(g_Lua, totalSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
+        lua_setfield(g_Lua, -2, "TotalGameTime");
+        lua_newtable(g_Lua);
+        lua_pushnumber(g_Lua, deltaSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
+        lua_pushnumber(g_Lua, deltaSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
+        lua_setfield(g_Lua, -2, "ElapsedGameTime");
+        const int gameTimeIdx = lua_gettop(g_Lua);
 
-            lua_newtable(g_Lua);
-            lua_pushnumber(g_Lua, totalSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
-            lua_pushnumber(g_Lua, totalSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
-            lua_setfield(g_Lua, -2, "TotalGameTime");
-
-            lua_newtable(g_Lua);
-            lua_pushnumber(g_Lua, deltaSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
-            lua_pushnumber(g_Lua, deltaSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
-            lua_setfield(g_Lua, -2, "ElapsedGameTime");
-
-            if (lua_pcall(g_Lua, 1, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("Event:OnTick runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+        for (size_t i = 0; i < g_LuaTickRefs.size(); ++i) {
+            const int ref = g_LuaTickRefs[i];
+            lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, ref);
+            if (lua_isfunction(g_Lua, -1)) {
+                lua_pushvalue(g_Lua, gameTimeIdx);
+                if (LuaSafeCall(g_Lua, 1, 0) != LUA_OK) {
+                    PushLuaLogThrottled("Event:OnTick runtime error: " + LuaErrStr(g_Lua));
+                    lua_pop(g_Lua, 1);
+                }
+            } else {
                 lua_pop(g_Lua, 1);
             }
-        } else {
-            lua_pop(g_Lua, 1);
         }
+        lua_settop(g_Lua, gameTimeIdx - 1);   // guarantees no stack growth across frames, whatever the handlers did
     }
 
     // High-performance CPU throttling: Run marker trigger/distance loop at 40Hz (25ms)
@@ -3446,18 +3630,28 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
         }
     }
 
-    if (g_Lua && thisPackLua.count("pack.lua")) {
-        const std::string& packLua = thisPackLua["pack.lua"];
+    // Entry script: root pack.lua, else the shallowest pack.lua in a sub-folder (some packs nest everything).
+    std::string packLuaKey;
+    if (thisPackLua.count("pack.lua")) {
+        packLuaKey = "pack.lua";
+    } else {
+        for (const auto& [k, code] : thisPackLua) {
+            if (std::filesystem::path(k).filename().string() != "pack.lua") continue;
+            if (packLuaKey.empty() || k.size() < packLuaKey.size()) packLuaKey = k;
+        }
+    }
+    if (g_Lua && !packLuaKey.empty()) {
+        const std::string& packLua = thisPackLua[packLuaKey];
         g_PackEntryLuaScripts.push_back({ summary.Filename, packLua });
-        if (luaL_loadbuffer(g_Lua, packLua.data(), packLua.size(), (summary.Filename + ":pack.lua").c_str()) == LUA_OK) {
-            if (lua_pcall(g_Lua, 0, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("pack.lua runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+        if (LuaLoadText(g_Lua, packLua, summary.Filename + ":" + packLuaKey) == LUA_OK) {
+            if (LuaSafeCall(g_Lua, 0, 0) != LUA_OK) {
+                PushLuaLog("pack.lua runtime error: " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             } else {
                 PushLuaLog("Executed pack.lua from " + summary.Filename, LOGL_INFO);
             }
         } else {
-            PushLuaLog(std::string("pack.lua load error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+            PushLuaLog("pack.lua load error: " + LuaErrStr(g_Lua), LOGL_WARNING);
             lua_pop(g_Lua, 1);
         }
     }
@@ -4664,18 +4858,33 @@ static void OnInteractKeybind(const char* aIdentifier, bool aIsRelease) {
     }
 }
 
+// Pack:CreateMarker() appends to g_Markers. Re-running pack.lua on every map change (after InitLuaVM wiped the
+// VM) therefore ADDED another full copy of every script-created marker each time: unbounded growth of g_Markers,
+// duplicated rendering/trigger work and an ever-longer linear scan in Lua_World_MarkerByGuid.
+// The VM is rebuilt right before this runs, so no Lua table can still hold an index into g_Markers.
+static void PurgeLuaCreatedMarkers() {
+    const size_t before = g_Markers.size();
+    g_Markers.erase(std::remove_if(g_Markers.begin(), g_Markers.end(),
+                                   [](const RuntimeMarker& m) { return m.FromLua; }),
+                    g_Markers.end());
+    if (g_Markers.size() != before) g_CategoryCountsCacheDirty = true;
+}
+
 static void ReExecuteAllPackScriptsForCurrentMap() {
     if (g_PackEntryLuaScripts.empty()) return;
     InitLuaVM();
+    if (!g_Lua) return;
+    PurgeLuaCreatedMarkers();
     for (const auto& [packName, packLua] : g_PackEntryLuaScripts) {
         if (!IsPackEnabled(packName)) continue;
         g_CurrentPackName = packName;
-        if (luaL_loadbuffer(g_Lua, packLua.data(), packLua.size(), (packName + ":pack.lua").c_str()) == LUA_OK) {
-            if (lua_pcall(g_Lua, 0, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("pack.lua runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+        if (LuaLoadText(g_Lua, packLua, packName + ":pack.lua") == LUA_OK) {
+            if (LuaSafeCall(g_Lua, 0, 0) != LUA_OK) {
+                PushLuaLog("pack.lua runtime error: " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             }
         } else {
+            PushLuaLog("pack.lua load error: " + LuaErrStr(g_Lua), LOGL_WARNING);
             lua_pop(g_Lua, 1);
         }
     }
@@ -4833,8 +5042,8 @@ static void RenderLuaMenuNodeImGui(LuaMenuNode& node) {
         lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, node.CallbackRef);
         if (lua_isfunction(g_Lua, -1)) {
             lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, node.LuaTableRef);
-            if (lua_pcall(g_Lua, 1, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("Menu callback error (") + node.Name + "): " + lua_tostring(g_Lua, -1), LOGL_WARNING);
+            if (LuaSafeCall(g_Lua, 1, 0) != LUA_OK) {
+                PushLuaLog("Menu callback error (" + node.Name + "): " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             }
             SaveConfigToDisk();

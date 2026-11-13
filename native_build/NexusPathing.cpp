@@ -24,7 +24,7 @@
 #include <shellapi.h>
 #include <d3d11.h>
 #include <dxgi.h>
-#include <d3dcompiler.h>
+#include <wincrypt.h>
 #include <wrl/client.h>
 
 #include "Nexus.h"
@@ -34,15 +34,25 @@
 #include "pugixml/pugixml.hpp"
 #include "stb_image.h"
 
+// Lua is now compiled as C++ (see ./np): luaL_error()/lua_error() then THROW instead of longjmp, so std::string and
+// other destructors in our C bindings run correctly (a longjmp over them leaked memory and was undefined behaviour).
+// Define NP_LUA_BUILT_AS_C only if you still link a prebuilt liblua.a that was compiled as C.
+#ifdef NP_LUA_BUILT_AS_C
 extern "C" {
+#endif
 #include "lua/lua.h"
 #include "lua/lualib.h"
 #include "lua/lauxlib.h"
+#ifdef NP_LUA_BUILT_AS_C
 }
+#endif
 
 #include <cstdint>
 #include <cmath>
 #include <cstring>
+#include <cctype>
+#include <cerrno>
+#include <system_error>
 #include <cstdio>
 #include <string>
 #include <string_view>
@@ -52,6 +62,7 @@ extern "C" {
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <chrono>
 #include <memory>
 #include <functional>
@@ -217,6 +228,7 @@ struct RuntimeMarker {
     std::string IconTextureId;
     Texture_t*  CachedTexture       = nullptr;
     ID3D11ShaderResourceView* NativeSRV = nullptr;
+    uint64_t    TexRetryAtMs        = 0;       // earliest time to retry a deferred / transiently failed texture load
     // Lua script attributes
     std::string ScriptOnce;
     std::string ScriptTick;
@@ -227,6 +239,7 @@ struct RuntimeMarker {
     bool        ScriptAutoTriggered = false;
     bool        IsFocused           = false;
     bool        IsVisible           = true;
+    bool        FromLua             = false;   // created by Pack:CreateMarker; purged before pack.lua re-runs
 };
 
 struct RuntimeTrail {
@@ -239,6 +252,7 @@ struct RuntimeTrail {
     std::string          TextureId;
     Texture_t*           CachedTexture      = nullptr;
     ID3D11ShaderResourceView* NativeSRV     = nullptr;
+    uint64_t             TexRetryAtMs       = 0;
     Vec4                 TintColor          = { 1.0f, 1.0f, 1.0f, 0.92f };
     float                AnimSpeed          = 1.0f;
     float                TrailScale         = 1.0f;
@@ -253,6 +267,9 @@ struct RuntimeTrail {
     uint32_t             MountFilterMask    = 0;
     std::vector<std::vector<Vec3>> Segments;
     std::vector<std::vector<Vec3>> CornerRights;
+    Vec3                           BoundMin{};   // AABB of all points (computed with CornerRights): whole-trail distance culling
+    Vec3                           BoundMax{};
+    bool                           HasBounds = false;
     bool                 IsVisible          = true;
 };
 
@@ -296,14 +313,32 @@ static std::string ToLowerAscii(std::string s) {
     return s;
 }
 
+// Canonical, lower-cased, archive-relative path: separators unified, "." / empty segments dropped, ".." resolved
+// without ever climbing above the root, and ':' removed so a drive letter can never make the path absolute.
 static std::string NormalizeArchivePath(std::string s) {
     std::replace(s.begin(), s.end(), '\\', '/');
-    while (!s.empty() && (s.front() == '/' || s.front() == '.')) {
-        if (s.rfind("./", 0) == 0) s.erase(0, 2);
-        else if (s.front() == '/') s.erase(0, 1);
-        else break;
+    std::vector<std::string> parts;
+    size_t i = 0;
+    while (i <= s.size()) {
+        size_t j = s.find('/', i);
+        if (j == std::string::npos) j = s.size();
+        std::string seg = s.substr(i, j - i);
+        seg.erase(std::remove(seg.begin(), seg.end(), ':'), seg.end());
+        if (seg.empty() || seg == ".") {
+            // skip
+        } else if (seg == "..") {
+            if (!parts.empty()) parts.pop_back();
+        } else {
+            parts.push_back(std::move(seg));
+        }
+        i = j + 1;
     }
-    return ToLowerAscii(s);
+    std::string out;
+    for (size_t k = 0; k < parts.size(); ++k) {
+        if (k) out += '/';
+        out += parts[k];
+    }
+    return ToLowerAscii(out);
 }
 
 static Vec4 ParseHexColor(const std::string& hexStr, float alpha = 1.0f) {
@@ -319,18 +354,23 @@ static Vec4 ParseHexColor(const std::string& hexStr, float alpha = 1.0f) {
     return { 1.0f, 1.0f, 1.0f, alpha };
 }
 
+// NaN / Inf ("nan", "inf", "1e999") are rejected: they poison positions, alphas and fade maths downstream.
 static float SafeParseFloat(const std::string& s, float fallback) {
     if (s.empty()) return fallback;
     char* endPtr = nullptr;
     float v = std::strtof(s.c_str(), &endPtr);
-    return (endPtr != s.c_str()) ? v : fallback;
+    if (endPtr == s.c_str() || !std::isfinite(v)) return fallback;
+    return v;
 }
 
+// Out-of-range values (e.g. 4294967295) fall back instead of silently wrapping to int32.
 static int32_t SafeParseInt(const std::string& s, int32_t fallback) {
     if (s.empty()) return fallback;
     char* endPtr = nullptr;
-    long v = std::strtol(s.c_str(), &endPtr, 10);
-    return (endPtr != s.c_str()) ? static_cast<int32_t>(v) : fallback;
+    errno = 0;
+    long long v = std::strtoll(s.c_str(), &endPtr, 10);
+    if (endPtr == s.c_str() || errno == ERANGE || v < INT32_MIN || v > INT32_MAX) return fallback;
+    return static_cast<int32_t>(v);
 }
 
 static bool SafeParseBool(const std::string& s, bool fallback) {
@@ -339,6 +379,192 @@ static bool SafeParseBool(const std::string& s, bool fallback) {
     if (low == "0" || low == "false" || low == "no") return false;
     if (low == "1" || low == "true" || low == "yes") return true;
     return fallback;
+}
+
+
+// ----------------------------------------------------------------------------
+// Path / file / config helpers (UTF-8 paths, safe file names, atomic writes, config escaping)
+// ----------------------------------------------------------------------------
+static bool EqualsIgnoreCaseAscii(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) != std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
+static std::string BaseNameOf(const std::string& p) {
+    const size_t k = p.find_last_of("/\\");
+    return (k == std::string::npos) ? p : p.substr(k + 1);
+}
+
+// miniz opens files through its own UTF-8 -> UTF-16 conversion on Windows, while std::filesystem::path::string()
+// returns the ANSI code page. Any non-ASCII character in the folder name (user name, localized folders) therefore made
+// mz_zip_reader_init_file() fail and the pack silently disappear. Always hand miniz UTF-8.
+static std::string PathToUtf8(const std::filesystem::path& p) {
+    const auto u = p.u8string();
+    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+static std::filesystem::path PathFromUtf8(const std::string& s) {
+    return std::filesystem::path(std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+
+// A pack file name must be a plain file name: no folders, no '..', no reserved characters, always .taco/.zip.
+static std::string SanitizePackFileName(const std::string& raw) {
+    std::string s = raw;
+    std::replace(s.begin(), s.end(), '\\', '/');
+    const size_t slash = s.find_last_of('/');
+    if (slash != std::string::npos) s = s.substr(slash + 1);
+    std::string clean;
+    for (char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 32 || std::strchr("<>:\"|?*", c)) continue;
+        clean += c;
+    }
+    while (!clean.empty() && (clean.back() == ' ' || clean.back() == '.')) clean.pop_back();
+    while (!clean.empty() && clean.front() == ' ') clean.erase(0, 1);
+    if (clean.empty()) clean = "pack.taco";
+    const std::string low = ToLowerAscii(clean);
+    const bool okExt = (low.size() > 5 && low.compare(low.size() - 5, 5, ".taco") == 0) ||
+                       (low.size() > 4 && low.compare(low.size() - 4, 4, ".zip") == 0);
+    if (!okExt) clean += ".taco";
+    if (clean.size() > 120) {
+        const std::string ext = clean.substr(clean.find_last_of('.'));
+        clean = clean.substr(0, 120 - ext.size()) + ext;
+    }
+    return clean;
+}
+
+static bool LooksLikeZip(const std::vector<uint8_t>& b) {
+    return b.size() >= 22 && b[0] == 'P' && b[1] == 'K' && (b[2] == 3 || b[2] == 5);
+}
+
+static uint64_t Fnv1a64(const uint8_t* d, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= d[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// Write to "<name>.np_tmp", verify every write, then rename over the destination. A crash, full disk or reader
+// holding the old file can no longer leave a truncated pack/config behind.
+static bool WriteFileAtomic(const std::filesystem::path& dest, const void* data, size_t size, std::string& err) {
+    std::filesystem::path tmp = dest;
+    tmp += ".np_tmp";
+    std::error_code ec;
+    {
+        std::ofstream ofs(tmp, std::ios::binary | std::ios::trunc);
+        if (!ofs) { err = "cannot create temporary file"; return false; }
+        ofs.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+        ofs.flush();
+        if (!ofs.good()) { ofs.close(); std::filesystem::remove(tmp, ec); err = "write failed (disk full?)"; return false; }
+    }
+    std::filesystem::rename(tmp, dest, ec);
+    if (ec) {
+        std::error_code ec2;
+        std::filesystem::remove(dest, ec2);
+        ec.clear();
+        std::filesystem::rename(tmp, dest, ec);
+    }
+    if (ec) { std::error_code ec3; std::filesystem::remove(tmp, ec3); err = "cannot replace file: " + ec.message(); return false; }
+    return true;
+}
+
+static bool FileHasSameContent(const std::filesystem::path& p, const std::vector<uint8_t>& bytes) {
+    std::error_code ec;
+    if (!std::filesystem::exists(p, ec) || std::filesystem::file_size(p, ec) != bytes.size()) return false;
+    std::ifstream ifs(p, std::ios::binary);
+    if (!ifs) return false;
+    std::vector<uint8_t> cur(bytes.size());
+    ifs.read(reinterpret_cast<char*>(cur.data()), static_cast<std::streamsize>(cur.size()));
+    return ifs.good() && Fnv1a64(cur.data(), cur.size()) == Fnv1a64(bytes.data(), bytes.size());
+}
+
+// Lua storage values are stored as "np1:" + escaped text so newlines survive a save/load round trip. Values without
+// the prefix (files written by older versions) are read verbatim.
+static std::string EscapeConfigValue(const std::string& v) {
+    std::string o;
+    o.reserve(v.size() + 4);
+    for (char c : v) {
+        if (c == '\\') o += "\\\\";
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') o += "\\r";
+        else o += c;
+    }
+    return o;
+}
+static std::string UnescapeConfigValue(const std::string& v) {
+    std::string o;
+    o.reserve(v.size());
+    for (size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '\\' && i + 1 < v.size()) {
+            const char n = v[i + 1];
+            if (n == 'n') { o += '\n'; ++i; continue; }
+            if (n == 'r') { o += '\r'; ++i; continue; }
+            if (n == '\\') { o += '\\'; ++i; continue; }
+        }
+        o += v[i];
+    }
+    return o;
+}
+// Keys end up as "key=value" lines in the config file: no control characters (config injection), no '='.
+static bool IsSafeConfigToken(const std::string& s) {
+    if (s.size() > 160) return false;
+    for (char c : s) {
+        const unsigned char u = static_cast<unsigned char>(c);
+        if (u < 32 || c == '=') return false;
+    }
+    return true;
+}
+
+static std::string BytesToHex(const uint8_t* d, size_t n) {
+    static const char* k = "0123456789abcdef";
+    std::string o;
+    o.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) { o += k[d[i] >> 4]; o += k[d[i] & 15]; }
+    return o;
+}
+static bool HexToBytes(const std::string& h, std::vector<uint8_t>& out) {
+    if (h.size() % 2) return false;
+    auto nib = [](char c) -> int { return (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'f') ? c - 'a' + 10 : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1; };
+    out.clear();
+    out.reserve(h.size() / 2);
+    for (size_t i = 0; i < h.size(); i += 2) {
+        const int a = nib(h[i]), b = nib(h[i + 1]);
+        if (a < 0 || b < 0) return false;
+        out.push_back(static_cast<uint8_t>(a * 16 + b));
+    }
+    return true;
+}
+
+// The GW2 API key used to sit in config.ini as plain text. Protect it with Windows DPAPI (bound to the current user).
+static bool ProtectSecretToHex(const std::string& plain, std::string& outHex) {
+    if (plain.empty()) { outHex.clear(); return true; }
+    DATA_BLOB in{};
+    in.pbData = reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()));
+    in.cbData = static_cast<DWORD>(plain.size());
+    DATA_BLOB out{};
+    if (!CryptProtectData(&in, L"NexusPathing GW2 API key", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) return false;
+    outHex = BytesToHex(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return true;
+}
+static bool UnprotectSecretFromHex(const std::string& hex, std::string& outPlain) {
+    std::vector<uint8_t> raw;
+    if (!HexToBytes(hex, raw) || raw.empty()) return false;
+    DATA_BLOB in{};
+    in.pbData = raw.data();
+    in.cbData = static_cast<DWORD>(raw.size());
+    DATA_BLOB out{};
+    if (!CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) return false;
+    outPlain.assign(reinterpret_cast<const char*>(out.pbData), out.cbData);
+    SecureZeroMemory(out.pbData, out.cbData);
+    LocalFree(out.pbData);
+    return true;
+}
+
+// Script registry key: scripts are stored per pack so two packs with the same module name no longer overwrite each other.
+static std::string LuaScriptKey(const std::string& packName, const std::string& normPath) {
+    return ToLowerAscii(packName) + "|" + normPath;
 }
 
 // ============================================================================
@@ -372,7 +598,10 @@ static bool ParseTrlBinaryBuffer(const uint8_t* data, size_t byteLen, int32_t& o
 
     for (size_t i = 0; i < numPts; ++i) {
         const TrlPoint_t& p = pts[i];
-        bool isBreak = (std::fabs(p.X) < 1e-5f) && (std::fabs(p.Y) < 1e-5f) && (std::fabs(p.Z) < 1e-5f);
+        const bool finite = std::isfinite(p.X) && std::isfinite(p.Y) && std::isfinite(p.Z) &&
+                            std::fabs(p.X) < 1.0e7f && std::fabs(p.Y) < 1.0e7f && std::fabs(p.Z) < 1.0e7f;
+        // a corrupt (NaN / huge) point ends the current segment instead of poisoning the vertex data
+        bool isBreak = !finite || ((std::fabs(p.X) < 1e-5f) && (std::fabs(p.Y) < 1e-5f) && (std::fabs(p.Z) < 1e-5f));
         if (isBreak) {
             if (!currentSeg.empty()) {
                 outSegments.push_back(std::move(currentSeg));
@@ -390,226 +619,89 @@ static bool ParseTrlBinaryBuffer(const uint8_t* data, size_t byteLen, int32_t& o
 }
 
 // ============================================================================
-// 5. D3D11 STATE BACKUP & RESTORE GUARD
+// 5. TEXTURE MIP CHAIN
+// ----------------------------------------------------------------------------
+// All drawing goes through ImGui draw lists (see RenderWorld). The HLSL shaders, constant buffers, blend/depth/raster
+// states and D3D11StateBackup that used to live here were never used by any draw call, but compiling the shaders at
+// startup was fatal: if d3dcompiler_47.dll was missing/blocked, Initialize() failed and NOTHING was drawn. Removed.
 // ============================================================================
-struct D3D11StateBackup {
-    ID3D11DeviceContext*        ctx = nullptr;
-    D3D11_PRIMITIVE_TOPOLOGY    topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-    ID3D11InputLayout*          inputLayout = nullptr;
-    ID3D11VertexShader*         vs = nullptr;
-    ID3D11PixelShader*          ps = nullptr;
-    ID3D11Buffer*               vsCBs[2] = { nullptr, nullptr };
-    ID3D11Buffer*               psCBs[2] = { nullptr, nullptr };
-    ID3D11ShaderResourceView*   psSRV = nullptr;
-    ID3D11SamplerState*         psSampler = nullptr;
-    ID3D11Buffer*               vb = nullptr;
-    UINT                        vbStride = 0;
-    UINT                        vbOffset = 0;
-    ID3D11BlendState*           blendState = nullptr;
-    FLOAT                       blendFactor[4] = {};
-    UINT                        sampleMask = 0;
-    ID3D11DepthStencilState*    depthState = nullptr;
-    UINT                        stencilRef = 0;
-    ID3D11RasterizerState*      rasterState = nullptr;
 
-    explicit D3D11StateBackup(ID3D11DeviceContext* aCtx) : ctx(aCtx) {
-        if (!ctx) return;
-        ctx->IAGetPrimitiveTopology(&topology);
-        ctx->IAGetInputLayout(&inputLayout);
-        ctx->VSGetShader(&vs, nullptr, nullptr);
-        ctx->PSGetShader(&ps, nullptr, nullptr);
-        ctx->VSGetConstantBuffers(0, 2, vsCBs);
-        ctx->PSGetConstantBuffers(0, 2, psCBs);
-        ctx->PSGetShaderResources(0, 1, &psSRV);
-        ctx->PSGetSamplers(0, 1, &psSampler);
-        ctx->IAGetVertexBuffers(0, 1, &vb, &vbStride, &vbOffset);
-        ctx->OMGetBlendState(&blendState, blendFactor, &sampleMask);
-        ctx->OMGetDepthStencilState(&depthState, &stencilRef);
-        ctx->RSGetState(&rasterState);
+// CPU box-filter mip chain (levels 1..N; level 0 is the source). Alpha-weighted so fully transparent texels do not
+// darken/halo the edges of icons when they shrink. Returns the number of generated levels.
+static int BuildMipChain(const uint8_t* level0, int w, int h,
+                         std::vector<std::vector<uint8_t>>& outLevels, std::vector<int>& outW, std::vector<int>& outH) {
+    outLevels.clear(); outW.clear(); outH.clear();
+    const uint8_t* src = level0;
+    int sw = w, sh = h;
+    while (sw > 1 || sh > 1) {
+        const int dw = std::max(1, sw / 2), dh = std::max(1, sh / 2);
+        std::vector<uint8_t> dst(static_cast<size_t>(dw) * dh * 4);
+        for (int y = 0; y < dh; ++y) {
+            const int y0 = std::min(y * 2, sh - 1), y1 = std::min(y * 2 + 1, sh - 1);
+            for (int x = 0; x < dw; ++x) {
+                const int x0 = std::min(x * 2, sw - 1), x1 = std::min(x * 2 + 1, sw - 1);
+                const uint8_t* px[4] = {
+                    src + (static_cast<size_t>(y0) * sw + x0) * 4, src + (static_cast<size_t>(y0) * sw + x1) * 4,
+                    src + (static_cast<size_t>(y1) * sw + x0) * 4, src + (static_cast<size_t>(y1) * sw + x1) * 4 };
+                float r = 0, g = 0, b = 0, a = 0, rr = 0, gg = 0, bb = 0;
+                for (const uint8_t* q : px) {
+                    const float qa = q[3];
+                    r += q[0] * qa; g += q[1] * qa; b += q[2] * qa; a += qa;
+                    rr += q[0]; gg += q[1]; bb += q[2];
+                }
+                uint8_t* o = &dst[(static_cast<size_t>(y) * dw + x) * 4];
+                if (a > 0.0f) { o[0] = static_cast<uint8_t>(r / a + 0.5f); o[1] = static_cast<uint8_t>(g / a + 0.5f); o[2] = static_cast<uint8_t>(b / a + 0.5f); }
+                else          { o[0] = static_cast<uint8_t>(rr / 4 + 0.5f); o[1] = static_cast<uint8_t>(gg / 4 + 0.5f); o[2] = static_cast<uint8_t>(bb / 4 + 0.5f); }
+                o[3] = static_cast<uint8_t>(a / 4 + 0.5f);
+            }
+        }
+        outLevels.push_back(std::move(dst));
+        outW.push_back(dw); outH.push_back(dh);
+        src = outLevels.back().data();
+        sw = dw; sh = dh;
     }
-
-    ~D3D11StateBackup() {
-        if (!ctx) return;
-        ctx->IASetPrimitiveTopology(topology);
-        ctx->IASetInputLayout(inputLayout);
-        ctx->VSSetShader(vs, nullptr, 0);
-        ctx->PSSetShader(ps, nullptr, 0);
-        ctx->VSSetConstantBuffers(0, 2, vsCBs);
-        ctx->PSSetConstantBuffers(0, 2, psCBs);
-        ctx->PSSetShaderResources(0, 1, &psSRV);
-        ctx->PSSetSamplers(0, 1, &psSampler);
-        ctx->IASetVertexBuffers(0, 1, &vb, &vbStride, &vbOffset);
-        ctx->OMSetBlendState(blendState, blendFactor, sampleMask);
-        ctx->OMSetDepthStencilState(depthState, stencilRef);
-        ctx->RSSetState(rasterState);
-
-        if (inputLayout) inputLayout->Release();
-        if (vs) vs->Release();
-        if (ps) ps->Release();
-        for (auto* b : vsCBs) if (b) b->Release();
-        for (auto* b : psCBs) if (b) b->Release();
-        if (psSRV) psSRV->Release();
-        if (psSampler) psSampler->Release();
-        if (vb) vb->Release();
-        if (blendState) blendState->Release();
-        if (depthState) depthState->Release();
-        if (rasterState) rasterState->Release();
-    }
-};
-
-// ============================================================================
-// 6. DIRECTX 11 HLSL SHADERS & WORLD-SPACE + MINIMAP RENDERER
-// ============================================================================
-static const char* g_PathingHlslSource = R"(
-cbuffer FrameConstants : register(b0) {
-    float4x4 uViewProj;
-    float3   uCameraPos;
-    float    uGlobalTime;
-    float3   uAvatarPos;
-    float    uPlayerCutoutRadius;
-};
-
-cbuffer ObjectConstants : register(b1) {
-    float4 uTintColor;
-    float  uFadeNear;
-    float  uFadeFar;
-    float  uAnimSpeed;
-    float  uTrailScale;
-};
-
-Texture2D    uMainTex    : register(t0);
-SamplerState uLinearWrap : register(s0);
-
-struct TrailVSInput {
-    float3 Position : POSITION;
-    float3 NextPos  : TEXCOORD0;
-    float3 PrevPos  : TEXCOORD1;
-    float2 UV       : TEXCOORD2;
-};
-
-struct TrailPSInput {
-    float4 ClipPos  : SV_POSITION;
-    float3 WorldPos : TEXCOORD0;
-    float2 UV       : TEXCOORD1;
-};
-
-TrailPSInput TrailVS_Main(TrailVSInput input) {
-    TrailPSInput output;
-    float3 diff     = input.NextPos - input.PrevPos;
-    float3 tangent  = (length(diff) > 0.0001f) ? normalize(diff) : float3(1.0f, 0.0f, 0.0f);
-    float3 toCam    = normalize(uCameraPos - input.Position);
-    float3 right    = normalize(cross(tangent, toCam));
-    float halfWidth = 0.508f * uTrailScale;
-    float3 worldPos = input.Position + right * (input.UV.x * halfWidth);
-
-    output.WorldPos = worldPos;
-    output.ClipPos  = mul(float4(worldPos, 1.0f), uViewProj);
-    output.UV       = float2(input.UV.x * 0.5f + 0.5f, input.UV.y - (uGlobalTime * uAnimSpeed));
-    return output;
+    return static_cast<int>(outLevels.size());
 }
 
-float4 TrailPS_Main(TrailPSInput input) : SV_TARGET {
-    float4 texColor    = uMainTex.Sample(uLinearWrap, input.UV);
-    float distToCam    = distance(input.WorldPos, uCameraPos);
-    float farFade      = 1.0f - smoothstep(uFadeNear, max(uFadeNear + 0.1f, uFadeFar), distToCam);
-    float distToAvatar = distance(input.WorldPos, uAvatarPos);
-    float playerCutout = smoothstep(uPlayerCutoutRadius * 0.35f, max(0.01f, uPlayerCutoutRadius), distToAvatar);
-
-    float finalAlpha   = texColor.a * uTintColor.a * farFade * playerCutout;
-    if (finalAlpha <= 0.01f) discard;
-
-    return float4(texColor.rgb * uTintColor.rgb, finalAlpha);
-}
-)";
-
-struct alignas(16) FrameConstantBuffer_t {
-    Mat4x4 ViewProj;
-    Vec3   CameraPos;
-    float  GlobalTime;
-    Vec3   AvatarPos;
-    float  PlayerCutoutRadius;
-};
-
-struct alignas(16) ObjectConstantBuffer_t {
-    Vec4  TintColor;
-    float FadeNear;
-    float FadeFar;
-    float AnimSpeed;
-    float TrailScale;
-};
-
+// ============================================================================
+// 6. WORLD-SPACE + MINIMAP RENDERER (ImGui draw lists)
+// ============================================================================
 class D3D11Engine {
 public:
+    void LogMsg(ELogLevel level, const char* msg) const {
+        if (m_API && m_API->Log) m_API->Log(level, "NexusPathing", msg);
+    }
+    bool IsInitialized() const { return m_Initialized; }
+
+    // True when the game's swap chain now belongs to a different D3D11 device than the one our resources were created on
+    // (device recreated after a graphics reset): every cached SRV is then invalid and must be dropped.
+    bool DeviceDiffers(IDXGISwapChain* swapChain) const {
+        if (!m_Initialized || !swapChain) return false;
+        ComPtr<ID3D11Device> dev;
+        if (FAILED(swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(dev.GetAddressOf()))) || !dev) return false;
+        return dev.Get() != m_Device.Get();
+    }
+
     bool Initialize(IDXGISwapChain* swapChain, AddonAPI_t* api) {
         m_API = api;
         if (!swapChain) return false;
+        if (m_Initialized) Shutdown();
 
-        HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(m_Device.GetAddressOf()));
-        if (FAILED(hr) || !m_Device) return false;
-
+        ComPtr<ID3D11Device> device;
+        HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), reinterpret_cast<void**>(device.GetAddressOf()));
+        if (FAILED(hr) || !device) {
+            LogMsg(LOGL_WARNING, "IDXGISwapChain::GetDevice failed; world overlay stays disabled until the device is available");
+            return false;
+        }
+        m_Device = device;
         m_Device->GetImmediateContext(m_Context.GetAddressOf());
+        if (!m_Context) {
+            LogMsg(LOGL_WARNING, "GetImmediateContext returned null; world overlay disabled");
+            m_Device.Reset();
+            return false;
+        }
 
-        ComPtr<ID3DBlob> vsBlob, psBlob, errBlob;
-        hr = D3DCompile(g_PathingHlslSource, std::strlen(g_PathingHlslSource), "PathingShaders.hlsl",
-                        nullptr, nullptr, "TrailVS_Main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                        vsBlob.GetAddressOf(), errBlob.GetAddressOf());
-        if (FAILED(hr)) return false;
-
-        hr = D3DCompile(g_PathingHlslSource, std::strlen(g_PathingHlslSource), "PathingShaders.hlsl",
-                        nullptr, nullptr, "TrailPS_Main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                        psBlob.GetAddressOf(), errBlob.GetAddressOf());
-        if (FAILED(hr)) return false;
-
-        m_Device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, m_TrailVS.GetAddressOf());
-        m_Device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, m_TrailPS.GetAddressOf());
-
-        D3D11_INPUT_ELEMENT_DESC layoutDesc[] = {
-            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 1, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-            { "TEXCOORD", 2, DXGI_FORMAT_R32G32_FLOAT,    0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-        };
-        m_Device->CreateInputLayout(layoutDesc, 4, vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), m_InputLayout.GetAddressOf());
-
-        D3D11_BUFFER_DESC cbDesc{};
-        cbDesc.Usage          = D3D11_USAGE_DYNAMIC;
-        cbDesc.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
-        cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        cbDesc.ByteWidth = sizeof(FrameConstantBuffer_t);
-        m_Device->CreateBuffer(&cbDesc, nullptr, m_FrameCB.GetAddressOf());
-
-        cbDesc.ByteWidth = sizeof(ObjectConstantBuffer_t);
-        m_Device->CreateBuffer(&cbDesc, nullptr, m_ObjectCB.GetAddressOf());
-
-        D3D11_BLEND_DESC blendDesc{};
-        blendDesc.RenderTarget[0].BlendEnable           = TRUE;
-        blendDesc.RenderTarget[0].SrcBlend              = D3D11_BLEND_SRC_ALPHA;
-        blendDesc.RenderTarget[0].DestBlend             = D3D11_BLEND_INV_SRC_ALPHA;
-        blendDesc.RenderTarget[0].BlendOp               = D3D11_BLEND_OP_ADD;
-        blendDesc.RenderTarget[0].SrcBlendAlpha         = D3D11_BLEND_ONE;
-        blendDesc.RenderTarget[0].DestBlendAlpha        = D3D11_BLEND_INV_SRC_ALPHA;
-        blendDesc.RenderTarget[0].BlendOpAlpha          = D3D11_BLEND_OP_ADD;
-        blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        m_Device->CreateBlendState(&blendDesc, m_BlendState.GetAddressOf());
-
-        // Disable depth testing during RT_Render overlay pass so trails never get rejected by cleared/UI depth buffer!
-        D3D11_DEPTH_STENCIL_DESC dsDesc{};
-        dsDesc.DepthEnable    = FALSE;
-        dsDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-        dsDesc.DepthFunc      = D3D11_COMPARISON_ALWAYS;
-        m_Device->CreateDepthStencilState(&dsDesc, m_NoDepthState.GetAddressOf());
-
-        // Disable backface culling so trails are visible from all camera angles
-        D3D11_RASTERIZER_DESC rsDesc{};
-        rsDesc.FillMode      = D3D11_FILL_SOLID;
-        rsDesc.CullMode      = D3D11_CULL_NONE;
-        rsDesc.ScissorEnable = FALSE;
-        dsDesc.DepthEnable   = FALSE;
-        rsDesc.DepthClipEnable = TRUE;
-        m_Device->CreateRasterizerState(&rsDesc, m_NoCullState.GetAddressOf());
-
-        // Linear Wrap Sampler for scrolling trail textures
+        // Linear sampler (clamp U, wrap V) for scrolling trail textures; installed through an ImGui draw callback.
         D3D11_SAMPLER_DESC sampDesc{};
         sampDesc.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sampDesc.AddressU       = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -618,9 +710,15 @@ public:
         sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
         sampDesc.MinLOD         = 0;
         sampDesc.MaxLOD         = D3D11_FLOAT32_MAX;
-        m_Device->CreateSamplerState(&sampDesc, m_LinearWrapSampler.GetAddressOf());
+        hr = m_Device->CreateSamplerState(&sampDesc, m_LinearWrapSampler.GetAddressOf());
+        if (FAILED(hr) || !m_LinearWrapSampler) {
+            LogMsg(LOGL_WARNING, "CreateSamplerState failed; world overlay disabled");
+            m_Context.Reset();
+            m_Device.Reset();
+            return false;
+        }
 
-        // Create default procedural chevron texture SRV in case a trail texture isn't loaded yet
+        // Default procedural chevron texture in case a trail texture is not available yet
         CreateDefaultChevronTexture();
 
         m_Initialized = true;
@@ -628,41 +726,58 @@ public:
     }
 
     ID3D11ShaderResourceView* LoadTextureFromMemory(const std::string& key, const void* data, size_t size) {
-        if (!m_Device || !data || size == 0) return nullptr;
+        if (!m_Device || !data || size == 0 || size > 0x7FFFFFFFu) return nullptr;
         auto it = m_NativeTextureCache.find(key);
         if (it != m_NativeTextureCache.end()) {
             return it->second.Get();
         }
+
+        // Read the header first: refuse decompression bombs (a tiny PNG can claim 20000x20000 = 1.6 GB of RGBA).
         int w = 0, h = 0, channels = 0;
+        constexpr int kMaxDim = 8192;
+        if (!stbi_info_from_memory(reinterpret_cast<const stbi_uc*>(data), static_cast<int>(size), &w, &h, &channels) ||
+            w <= 0 || h <= 0 || w > kMaxDim || h > kMaxDim) {
+            m_NativeTextureCache[key] = nullptr;
+            return nullptr;
+        }
         unsigned char* pixels = stbi_load_from_memory(
             reinterpret_cast<const stbi_uc*>(data),
             static_cast<int>(size),
             &w, &h, &channels, 4
         );
         if (!pixels || w <= 0 || h <= 0) {
+            if (pixels) stbi_image_free(pixels);
             m_NativeTextureCache[key] = nullptr;
             return nullptr;
         }
 
-        // Compute mip levels or single level RGBA8 texture
+        // Full mip chain: distant icons / trail ribbons no longer shimmer (they were sampled from level 0 only).
+        std::vector<std::vector<uint8_t>> mips;
+        std::vector<int> mipW, mipH;
+        const int mipCount = BuildMipChain(pixels, w, h, mips, mipW, mipH);
+
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width            = static_cast<UINT>(w);
         desc.Height           = static_cast<UINT>(h);
-        desc.MipLevels        = 1;
+        desc.MipLevels        = static_cast<UINT>(mipCount + 1);
         desc.ArraySize        = 1;
         desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
         desc.Usage            = D3D11_USAGE_IMMUTABLE;
         desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
 
-        D3D11_SUBRESOURCE_DATA initData{};
-        initData.pSysMem     = pixels;
-        initData.SysMemPitch = static_cast<UINT>(w * 4);
+        std::vector<D3D11_SUBRESOURCE_DATA> initData(static_cast<size_t>(mipCount) + 1);
+        initData[0].pSysMem     = pixels;
+        initData[0].SysMemPitch = static_cast<UINT>(w * 4);
+        for (int i = 0; i < mipCount; ++i) {
+            initData[static_cast<size_t>(i) + 1].pSysMem     = mips[static_cast<size_t>(i)].data();
+            initData[static_cast<size_t>(i) + 1].SysMemPitch = static_cast<UINT>(mipW[static_cast<size_t>(i)] * 4);
+        }
 
         ComPtr<ID3D11Texture2D> tex;
         ComPtr<ID3D11ShaderResourceView> srv;
-        if (SUCCEEDED(m_Device->CreateTexture2D(&desc, &initData, tex.GetAddressOf())) && tex) {
-            m_Device->CreateShaderResourceView(tex.Get(), nullptr, srv.GetAddressOf());
+        if (SUCCEEDED(m_Device->CreateTexture2D(&desc, initData.data(), tex.GetAddressOf())) && tex) {
+            if (FAILED(m_Device->CreateShaderResourceView(tex.Get(), nullptr, srv.GetAddressOf()))) srv.Reset();
         }
         stbi_image_free(pixels);
 
@@ -726,14 +841,6 @@ public:
         ClearTextureCache();   // FIX 1: previously leaked SRVs (and kept the device alive) past unload
         m_DefaultChevronSRV.Reset();
         m_LinearWrapSampler.Reset();
-        m_NoCullState.Reset();
-        m_NoDepthState.Reset();
-        m_BlendState.Reset();
-        m_ObjectCB.Reset();
-        m_FrameCB.Reset();
-        m_InputLayout.Reset();
-        m_TrailPS.Reset();
-        m_TrailVS.Reset();
         m_Context.Reset();
         m_Device.Reset();
         m_Initialized = false;
@@ -743,6 +850,15 @@ public:
         trail.CornerRights.clear();
         trail.CornerRights.resize(trail.Segments.size());
         Vec3 up{ 0.0f, 1.0f, 0.0f };
+
+        trail.HasBounds = false;
+        for (const auto& seg : trail.Segments) {
+            for (const Vec3& pt : seg) {
+                if (!trail.HasBounds) { trail.BoundMin = pt; trail.BoundMax = pt; trail.HasBounds = true; continue; }
+                trail.BoundMin = { std::min(trail.BoundMin.x, pt.x), std::min(trail.BoundMin.y, pt.y), std::min(trail.BoundMin.z, pt.z) };
+                trail.BoundMax = { std::max(trail.BoundMax.x, pt.x), std::max(trail.BoundMax.y, pt.y), std::max(trail.BoundMax.z, pt.z) };
+            }
+        }
 
         for (size_t sIdx = 0; sIdx < trail.Segments.size(); ++sIdx) {
             const auto& seg = trail.Segments[sIdx];
@@ -845,7 +961,8 @@ public:
         Vec3 avatar{ mumble.AvatarPosition.X, mumble.AvatarPosition.Y, mumble.AvatarPosition.Z };
         Vec3 camToAvatar = avatar - eye;
         float camToAvatarLenSq = camToAvatar.LengthSq();
-        float timeSec = static_cast<float>(GetTickCount64() % 3600000) * 0.001f;
+        // Double precision wall time: the old `tick % 3600000` made every animation jump once per hour.
+        const double timeD = static_cast<double>(GetTickCount64()) * 0.001;
 
         // Helper to compute smooth Player Spherical Cutout + Sightline Cutout opacity multiplier [0.0 .. 1.0]
         auto computePlayerCutoutMultiplier = [&](const Vec3& pt, bool canFade) -> float {
@@ -883,7 +1000,11 @@ public:
         // 1. Render Textured & Animated 3D Trail Ribbons onto ImGui::GetBackgroundDrawList()
         //    Uses Blish HUD world-up mitered ribbon normals + 0.45m 3D subdivision + 3D near-plane clipping
         //    so arrows never twist/distort at steep angles and trails never vanish when crossing the camera!
+        bool samplerOverridden = false;
+        // Vertex budget for this frame: ImGui draw lists with 16-bit indices overflow at 65k vertices (4 per quad).
+        int quadBudget = (io.BackendFlags & ImGuiBackendFlags_RendererHasVtxOffset) ? 60000 : 12000;
         if (renderTrails && !trails.empty() && g_TrailOpacity > 0.005f) {
+            samplerOverridden = true;
             drawList->AddCallback([](const ImDrawList*, const ImDrawCmd* cmd) {
                 auto* eng = static_cast<D3D11Engine*>(cmd->UserCallbackData);
                 if (eng && eng->GetContext() && eng->GetWrapSampler()) {
@@ -893,11 +1014,26 @@ public:
             }, this);
 
             for (auto& trail : trails) {
+                if (quadBudget <= 0) break;
                 if (g_OnlyShowCurrentMap ? (trail.MapId != currentMapId) : (trail.MapId != 0 && trail.MapId != currentMapId)) continue;
                 if (!trail.IsVisible || !trail.InGameVisibility || trail.Segments.empty()) continue;
 
                 if (trail.CornerRights.size() != trail.Segments.size()) {
                     PrecomputeTrailCornerRights(trail);
+                }
+
+                // Whole-trail early-out: a trail whose bounding box is beyond the cutoff costs O(1) instead of
+                // visiting every point of every segment every frame.
+                if (trail.HasBounds) {
+                    const float fFar  = trail.FadeFar * INCHES_TO_METERS;
+                    const float mDist = (g_MaxTrailDistance > 10.0f) ? g_MaxTrailDistance : 0.0f;
+                    const float cutoff = (fFar > 0.0f) ? (mDist > 0.0f ? std::min(fFar, mDist) : fFar) : mDist;
+                    if (cutoff > 0.0f) {
+                        const float ddx = std::max({ trail.BoundMin.x - eye.x, 0.0f, eye.x - trail.BoundMax.x });
+                        const float ddy = std::max({ trail.BoundMin.y - eye.y, 0.0f, eye.y - trail.BoundMax.y });
+                        const float ddz = std::max({ trail.BoundMin.z - eye.z, 0.0f, eye.z - trail.BoundMax.z });
+                        if (ddx * ddx + ddy * ddy + ddz * ddz > (cutoff + 4.0f) * (cutoff + 4.0f)) continue;
+                    }
                 }
 
                 ID3D11ShaderResourceView* srv = ResolveTrailSRV(trail);
@@ -908,7 +1044,8 @@ public:
                 float halfWidth = 0.508f * trail.TrailScale;
                 float fadeNearM = trail.FadeNear * INCHES_TO_METERS;
                 float fadeFarM  = trail.FadeFar * INCHES_TO_METERS;
-                float vScroll   = +(timeSec * trail.AnimSpeed);
+                // V wraps with period 1, so the offset is reduced modulo 1 (seamless, and float precision never degrades)
+                float vScroll   = static_cast<float>(std::fmod(timeD * trail.AnimSpeed, 1.0));
                 float subStepM  = std::clamp(g_TrailSubdivisionStep, 0.35f, 2.5f);
                 float maxDistM  = (g_MaxTrailDistance > 10.0f) ? g_MaxTrailDistance : 0.0f;
 
@@ -952,6 +1089,7 @@ public:
                         float invSteps = 1.0f / static_cast<float>(steps);
 
                         for (int s = 0; s < steps; ++s) {
+                            if (quadBudget <= 0) break;
                             float t0 = static_cast<float>(s) * invSteps;
                             float t1 = static_cast<float>(s + 1) * invSteps;
 
@@ -1018,6 +1156,7 @@ public:
                                 ImU32 col = ImGui::ColorConvertFloat4ToU32(
                                     ImVec4(trail.TintColor.x, trail.TintColor.y, trail.TintColor.z, alpha)
                                 );
+                                --quadBudget;
 
                                 if (srv) {
                                     drawList->AddImageQuad(
@@ -1051,7 +1190,7 @@ public:
                 float distToPlayer = (m.Position - avatar).Length();
                 if (m.HasBounce && distToPlayer <= m.TriggerRange * 2.5f) {
                     if (!m.BounceIsRise) {
-                        bounceY = std::fabs(std::sin(timeSec * (3.14159f / std::max(0.2f, m.BounceDuration)))) * m.BounceHeight;
+                        bounceY = static_cast<float>(std::fabs(std::sin(timeD * (3.14159265358979 / std::max(0.2f, m.BounceDuration))))) * m.BounceHeight;
                     } else {
                         bounceY = m.BounceHeight * 0.75f;
                     }
@@ -1105,6 +1244,13 @@ public:
                         1.5f
                     );
                 }
+            }
+
+            // The wrap sampler was installed through a draw callback; hand the sampler state back to ImGui so it does not
+            // leak into every later draw command (windows, text) of this frame.
+            if (samplerOverridden) {
+                drawList->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+                samplerOverridden = false;
             }
 
             // 2b. Render Blish HUD Pathing InfoModifier / Hint Banners for focused or nearby markers!
@@ -1273,6 +1419,7 @@ public:
         drawList->PushClipRect(clipMin, clipMax, true);
 
         // 1. Draw Trails on Minimap / World Map
+        int minimapLineBudget = 8000;   // per frame (each AddLine is several vertices)
         for (const auto& trail : trails) {
             if (g_OnlyShowCurrentMap ? (trail.MapId != currentMapId) : (trail.MapId != 0 && trail.MapId != currentMapId)) continue;
             if (!trail.IsVisible) continue;
@@ -1286,10 +1433,19 @@ public:
 
             for (const auto& seg : trail.Segments) {
                 if (seg.size() < 2) continue;
+                if (minimapLineBudget <= 0) break;
+                ImVec2 p1 = worldToMapScreen(seg[0].x, seg[0].z);
                 for (size_t i = 0; i < seg.size() - 1; ++i) {
-                    ImVec2 p1 = worldToMapScreen(seg[i].x, seg[i].z);
                     ImVec2 p2 = worldToMapScreen(seg[i + 1].x, seg[i + 1].z);
-                    drawList->AddLine(p1, p2, trailCol, thickness);
+                    // trivial reject: both ends beyond the same clip edge -> nothing visible, skip the vertices
+                    const float pad = thickness + 2.0f;
+                    const bool outside = (p1.x < clipMin.x - pad && p2.x < clipMin.x - pad) || (p1.x > clipMax.x + pad && p2.x > clipMax.x + pad) ||
+                                         (p1.y < clipMin.y - pad && p2.y < clipMin.y - pad) || (p1.y > clipMax.y + pad && p2.y > clipMax.y + pad);
+                    if (!outside) {
+                        drawList->AddLine(p1, p2, trailCol, thickness);
+                        if (--minimapLineBudget <= 0) break;
+                    }
+                    p1 = p2;
                 }
             }
         }
@@ -1335,14 +1491,6 @@ private:
     AddonAPI_t*                         m_API = nullptr;
     ComPtr<ID3D11Device>                m_Device;
     ComPtr<ID3D11DeviceContext>         m_Context;
-    ComPtr<ID3D11VertexShader>          m_TrailVS;
-    ComPtr<ID3D11PixelShader>           m_TrailPS;
-    ComPtr<ID3D11InputLayout>           m_InputLayout;
-    ComPtr<ID3D11Buffer>                m_FrameCB;
-    ComPtr<ID3D11Buffer>                m_ObjectCB;
-    ComPtr<ID3D11BlendState>            m_BlendState;
-    ComPtr<ID3D11DepthStencilState>     m_NoDepthState;
-    ComPtr<ID3D11RasterizerState>       m_NoCullState;
     ComPtr<ID3D11SamplerState>          m_LinearWrapSampler;
     ComPtr<ID3D11ShaderResourceView>    m_DefaultChevronSRV;
     std::unordered_map<std::string, ComPtr<ID3D11ShaderResourceView>> m_NativeTextureCache;
@@ -1370,8 +1518,23 @@ static lua_State*                                       g_Lua                   
 static std::vector<int>                                 g_LuaTickRefs;
 static std::unordered_map<std::string, std::string>     g_LuaScriptsInPack;
 static std::vector<std::pair<std::string, std::string>> g_PackEntryLuaScripts;
-static std::unordered_map<std::string, std::vector<uint8_t>> g_PackBinaryFiles;
+// (g_PackBinaryFiles removed: pack images are now read lazily from the archive; see MakePackFetcher)
 static std::string                                      g_CurrentPackName;
+// Pack whose archive is being parsed RIGHT NOW. It is not in g_LoadedPacks yet while its pack.lua runs, so lazy
+// texture reads need this to find the file (this is why images used to be pre-extracted into RAM).
+static std::string                                      g_LoadingPackName;
+static std::string                                      g_LoadingPackFullPath;
+static bool                                             g_FetchTransientFailure = false;   // archive could not be opened/read (locked, being replaced): retry later
+static bool                                             g_TexLoadDeferred       = false;   // last EnsurePackTextureLoaded() call was postponed, not failed
+static uint64_t                                         g_TexLoadDeferDelayMs   = 0;
+static bool                                             g_TextureBudgetActive   = false;   // true only while rendering
+static int                                              g_TextureLoadsThisFrame = 0;
+static constexpr int                                    kMaxTextureLoadsPerFrame = 6;      // first-use zip open + decode + upload is spread over frames
+static std::unordered_set<std::string>                  g_MissingTextureIds;   // negative cache: don't re-open the zip every frame for a bad path
+struct LoadingPackScope {
+    LoadingPackScope(const std::string& n, const std::string& p) { g_LoadingPackName = n; g_LoadingPackFullPath = p; }
+    ~LoadingPackScope() { g_LoadingPackName.clear(); g_LoadingPackFullPath.clear(); }
+};
 static int32_t                                          g_LastKnownMapId        = -1;
 static std::vector<std::string>                         g_LuaConsoleLogs;
 
@@ -1415,6 +1578,8 @@ struct Win32WorkerCtx {
     HMODULE               PinnedModule = nullptr;
 };
 
+static void OnWorkerException(const char* what);   // defined after the shared flags exist
+
 template <typename Fn>
 static void SpawnDetachedWin32Thread(Fn&& fn) {
     if (g_ShuttingDown.load()) return;
@@ -1433,7 +1598,13 @@ static void SpawnDetachedWin32Thread(Fn&& fn) {
         [](LPVOID lpParam) -> DWORD {
             auto* c = static_cast<Win32WorkerCtx*>(lpParam);
             HMODULE hMod = c->PinnedModule;
-            c->Fn();
+            try {
+                c->Fn();
+            } catch (const std::exception& e) {
+                OnWorkerException(e.what());
+            } catch (...) {
+                OnWorkerException("unknown exception");
+            }
             delete c;                                 // destroys captures while code is still guaranteed mapped
             g_ActiveWorkerThreads.fetch_sub(1);
             if (hMod) FreeLibraryAndExitThread(hMod, 0);   // never returns into our (possibly unloading) code
@@ -1498,8 +1669,96 @@ static void PushLuaLog(const std::string& msg, ELogLevel level = LOGL_INFO) {
     }
 }
 
+// ============================================================================
+// Lua hardening helpers (safe error strings, text-only loading, budgeted calls)
+// ============================================================================
+
+// lua_tostring() returns NULL for non-string errors (error({}), error(nil)); `std::string + NULL` is UB.
+static std::string LuaErrStr(lua_State* L, int idx = -1) {
+    if (!L) return "<no lua state>";
+    if (const char* s = lua_tostring(L, idx)) return s;
+    return std::string("<non-string error: ") + luaL_typename(L, idx) + ">";
+}
+
+// luaL_loadbuffer() does NOT skip a UTF-8 BOM (only luaL_loadfile does). Scripts saved by Windows editors
+// inside .taco archives start with one and fail with "unexpected symbol near '<\239>'".
+// Load as TEXT ONLY (mode "t") so a hostile pack cannot smuggle precompiled bytecode into the VM.
+static int LuaLoadText(lua_State* L, const std::string& code, const std::string& chunkName) {
+    size_t off = 0;
+    if (code.size() >= 3 && static_cast<unsigned char>(code[0]) == 0xEF &&
+        static_cast<unsigned char>(code[1]) == 0xBB && static_cast<unsigned char>(code[2]) == 0xBF) {
+        off = 3;
+    }
+    const std::string name = "=" + chunkName;   // '=' => shown verbatim in error messages
+    return luaL_loadbufferx(L, code.data() + off, code.size() - off, name.c_str(), "t");
+}
+
+// Instruction budget so a runaway `while true do end` in a pack script cannot freeze the render thread.
+static constexpr int LUA_HOOK_STEP          = 10000;
+static constexpr int LUA_INSTRUCTION_BUDGET = 20000000;   // per top-level call; raise if a big pack.lua needs more
+static int           g_LuaHookCounter       = 0;
+static int           g_LuaCallDepth         = 0;
+
+static bool g_LuaBudgetTripped = false;
+
+// Once the budget is exhausted the flag stays set and EVERY following hook call raises again, until the outermost host
+// call returns. The sandbox prelude wraps pcall/xpcall/coroutine.resume so a script cannot catch this error and loop on.
+static void LuaBudgetHook(lua_State* L, lua_Debug*) {
+    g_LuaHookCounter += LUA_HOOK_STEP;
+    if (g_LuaHookCounter > LUA_INSTRUCTION_BUDGET) {
+        g_LuaBudgetTripped = true;
+        luaL_error(L, "script exceeded instruction budget (possible infinite loop)");
+    }
+}
+static int Lua_BudgetTripped(lua_State* L) { lua_pushboolean(L, g_LuaBudgetTripped ? 1 : 0); return 1; }
+
+static int LuaMsgHandler(lua_State* L) {
+    const char* msg = lua_tostring(L, 1);
+    if (!msg) {
+        // keep non-string error objects intact; just describe them
+        msg = lua_pushfstring(L, "(error object is a %s value)", luaL_typename(L, 1));
+    }
+    luaL_traceback(L, L, msg, 1);
+    return 1;
+}
+
+// Drop-in replacement for lua_pcall() with traceback + instruction budget. Same stack contract as lua_pcall.
+static int LuaSafeCall(lua_State* L, int nargs, int nresults) {
+    const int base = lua_gettop(L) - nargs;
+    lua_pushcfunction(L, LuaMsgHandler);
+    lua_insert(L, base);
+    if (g_LuaCallDepth == 0) { g_LuaHookCounter = 0; g_LuaBudgetTripped = false; }
+    ++g_LuaCallDepth;
+    const int rc = lua_pcall(L, nargs, nresults, base);
+    --g_LuaCallDepth;
+    lua_remove(L, base);
+    return rc;
+}
+
+// Throttle repeated per-frame error spam (a failing Event:OnTick would otherwise log 144x/second).
+static void PushLuaLogThrottled(const std::string& msg, ELogLevel level = LOGL_WARNING) {
+    static uint64_t s_LastLog = 0;
+    static std::string s_LastMsg;
+    const uint64_t now = GetTickCount64();
+    if (msg == s_LastMsg && now - s_LastLog < 5000) return;
+    s_LastMsg = msg;
+    s_LastLog = now;
+    PushLuaLog(msg, level);
+}
+
 // Forward declarations for texture & category helpers used by Lua bindings
 using ArchiveFileFetcher = std::function<bool(const std::string& relPath, std::vector<uint8_t>& outBytes)>;
+
+// Never trust the size stored in a zip: a crafted entry can claim gigabytes. Check before extracting.
+static constexpr size_t kMaxXmlBytes   = 64u << 20;
+static constexpr size_t kMaxLuaBytes   = 8u << 20;
+static constexpr size_t kMaxTrlBytes   = 16u << 20;
+static constexpr size_t kMaxImageBytes = 64u << 20;
+static void* ExtractEntryCapped(mz_zip_archive* zip, mz_uint idx, size_t maxBytes, size_t* outSize) {
+    mz_zip_archive_file_stat st{};
+    if (!mz_zip_reader_file_stat(zip, idx, &st) || st.m_uncomp_size > maxBytes) return nullptr;
+    return mz_zip_reader_extract_to_heap(zip, idx, outSize, 0);
+}
 static std::string EnsurePackTextureLoaded(
     const std::string& packName,
     const std::string& relTexturePath,
@@ -1510,23 +1769,16 @@ static void SetCategoryChildrenEnabled(CategoryNode& node, bool enabled);
 static void SyncVisibilityWithCategories();
 static void CopyStringToClipboard(const std::string& utf8Text);
 
-static bool FetchFromCachedPackFiles(const std::string& relPath, std::vector<uint8_t>& outBytes) {
-    std::string norm = NormalizeArchivePath(relPath);
-    auto it = g_PackBinaryFiles.find(norm);
-    if (it == g_PackBinaryFiles.end()) {
-        std::string baseName = std::filesystem::path(norm).filename().string();
-        for (const auto& [k, bytes] : g_PackBinaryFiles) {
-            if (std::filesystem::path(k).filename().string() == baseName) {
-                it = g_PackBinaryFiles.find(k);
-                break;
-            }
-        }
-    }
-    if (it != g_PackBinaryFiles.end()) {
-        outBytes = it->second;
-        return true;
-    }
-    return false;
+static bool FetchFileFromLoadedPackArchive(const std::string& packName, const std::string& relPath, std::vector<uint8_t>& outBytes);
+
+// Pack-bound lazy fetcher. Images used to be extracted for EVERY Lua pack at load time and kept in a global map
+// for the whole session (hundreds of MB for big packs), and every fetch then copied the whole image again.
+// EnsurePackTextureLoaded() already caches the decoded texture by id, so the raw bytes are only needed once;
+// read them from the archive on demand instead and let them go right after the GPU upload.
+static ArchiveFileFetcher MakePackFetcher(const std::string& packName) {
+    return [packName](const std::string& relPath, std::vector<uint8_t>& outBytes) {
+        return FetchFileFromLoadedPackArchive(packName, relPath, outBytes);
+    };
 }
 
 // Lua C callbacks for Blish HUD Pathing API compatibility
@@ -1549,6 +1801,10 @@ static int Lua_DebugPrint(lua_State* L) {
 static int Lua_EventOnTick(lua_State* L) {
     int funcIdx = lua_isfunction(L, 1) ? 1 : (lua_isfunction(L, 2) ? 2 : 0);
     if (funcIdx != 0) {
+        if (g_LuaTickRefs.size() >= 256) {            // runaway registration guard (e.g. Event:OnTick inside a loop)
+            PushLuaLogThrottled("Event:OnTick: too many handlers registered (limit 256); ignoring");
+            return 0;
+        }
         lua_pushvalue(L, funcIdx);
         int ref = luaL_ref(L, LUA_REGISTRYINDEX);
         g_LuaTickRefs.push_back(ref);
@@ -1673,38 +1929,83 @@ static int Lua_ITexture(lua_State* L) {
 }
 
 static int Lua_Require(lua_State* L) {
-    const char* name = luaL_checkstring(L, 1);
-    if (!name) return 0;
-    std::string key = NormalizeArchivePath(name);
+    // NOTE: luaL_checkstring may throw/longjmp, so it runs before any std::string exists in this frame.
+    const char* nameC = luaL_checkstring(L, 1);
+
+    std::string key = NormalizeArchivePath(nameC);
     if (key.size() < 4 || key.substr(key.size() - 4) != ".lua") {
+        // Lua-style dotted module names ("lib.helpers" -> "lib/helpers.lua")
+        if (key.find('/') == std::string::npos) std::replace(key.begin(), key.end(), '.', '/');
         key += ".lua";
     }
 
-    auto it = g_LuaScriptsInPack.find(key);
+    // Resolve inside the pack whose script is running: exact path first, then the basename match with the
+    // lexicographically smallest path (deterministic, unlike iterating an unordered_map).
+    const std::string packPrefix = ToLowerAscii(g_CurrentPackName) + "|";
+    auto it = g_LuaScriptsInPack.find(packPrefix + key);
     if (it == g_LuaScriptsInPack.end()) {
-        std::string baseName = std::filesystem::path(key).filename().string();
-        for (const auto& [k, code] : g_LuaScriptsInPack) {
-            if (std::filesystem::path(k).filename().string() == baseName) {
-                it = g_LuaScriptsInPack.find(k);
-                break;
-            }
+        const std::string baseName = BaseNameOf(key);
+        for (auto cur = g_LuaScriptsInPack.begin(); cur != g_LuaScriptsInPack.end(); ++cur) {
+            if (cur->first.compare(0, packPrefix.size(), packPrefix) != 0) continue;
+            if (BaseNameOf(cur->first) != baseName) continue;
+            if (it == g_LuaScriptsInPack.end() || cur->first < it->first) it = cur;
         }
     }
+    if (it == g_LuaScriptsInPack.end()) {
+        PushLuaLog("Lua require: module not found in pack: " + key, LOGL_WARNING);
+        return 0;
+    }
+    const std::string resolved = it->first;
+    const std::string chunkName = resolved.substr(resolved.find('|') + 1);
 
-    if (it != g_LuaScriptsInPack.end()) {
-        if (luaL_loadbuffer(L, it->second.data(), it->second.size(), key.c_str()) == LUA_OK) {
-            if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
-                return 1;
-            } else {
-                PushLuaLog(std::string("Lua require runtime error: ") + lua_tostring(L, -1), LOGL_WARNING);
-                lua_pop(L, 1);
-            }
-        } else {
-            PushLuaLog(std::string("Lua require syntax error: ") + lua_tostring(L, -1), LOGL_WARNING);
-            lua_pop(L, 1);
-        }
+    // package.loaded-style cache in the registry: a module runs ONCE per VM. A lightuserdata sentinel marks
+    // "currently loading" so circular requires fail cleanly.
+    static char s_LoadingSentinel;
+    lua_getfield(L, LUA_REGISTRYINDEX, "NexusPathing.loaded");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "NexusPathing.loaded");
     }
-    return 0;
+    const int cacheIdx = lua_gettop(L);
+
+    lua_getfield(L, cacheIdx, resolved.c_str());
+    if (lua_touserdata(L, -1) == &s_LoadingSentinel) {
+        lua_settop(L, cacheIdx - 1);
+        PushLuaLog("Lua require: circular dependency on " + chunkName, LOGL_WARNING);
+        return 0;
+    }
+    if (!lua_isnil(L, -1)) {            // cache hit
+        lua_remove(L, cacheIdx);
+        return 1;
+    }
+    lua_pop(L, 1);
+
+    lua_pushlightuserdata(L, &s_LoadingSentinel);
+    lua_setfield(L, cacheIdx, resolved.c_str());
+
+    if (LuaLoadText(L, it->second, chunkName) != LUA_OK) {
+        PushLuaLog("Lua require syntax error: " + LuaErrStr(L), LOGL_WARNING);
+        lua_settop(L, cacheIdx);
+        lua_pushnil(L);
+        lua_setfield(L, cacheIdx, resolved.c_str());
+        lua_settop(L, cacheIdx - 1);
+        return 0;
+    }
+    if (LuaSafeCall(L, 0, 1) != LUA_OK) {
+        PushLuaLog("Lua require runtime error: " + LuaErrStr(L), LOGL_WARNING);
+        lua_settop(L, cacheIdx);
+        lua_pushnil(L);
+        lua_setfield(L, cacheIdx, resolved.c_str());
+        lua_settop(L, cacheIdx - 1);
+        return 0;
+    }
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); lua_pushboolean(L, 1); }
+    lua_pushvalue(L, -1);
+    lua_setfield(L, cacheIdx, resolved.c_str());
+    lua_remove(L, cacheIdx);
+    return 1;
 }
 
 static int Lua_NoOpReturnSelf(lua_State* L) {
@@ -1809,7 +2110,7 @@ static int Lua_Marker_SetTexture(lua_State* L) {
             m.IconTextureId = EnsurePackTextureLoaded(
                 m.PackName.empty() ? g_CurrentPackName : m.PackName,
                 texPath,
-                FetchFromCachedPackFiles,
+                MakePackFetcher(m.PackName.empty() ? g_CurrentPackName : m.PackName),
                 &m.NativeSRV
             );
         }
@@ -1900,13 +2201,79 @@ static int Lua_Marker_GetBehavior(lua_State* L) {
 
 static void PushCategoryLuaTable(lua_State* L, const std::string& typePath);
 
+// ----------------------------------------------------------------------------
+// Lua proxy helpers: shared metatables + weak proxy cache.
+// Before: every PushMarkerLuaTable/PushTrailLuaTable call allocated a proxy table AND a fresh metatable (2 tables
+// per call, per marker, at 40 Hz for script-tick markers; GetMarkers()/GetTrails() did it for every entry).
+// Now: one metatable per VM (registry, via luaL_newmetatable) and one proxy per index, cached in a weak-valued
+// registry table so the same marker always yields the same Lua table (also makes `a == b` / table keys behave).
+// Proxies hold no state of their own (all writes go through __newindex), so sharing them is safe.
+// ----------------------------------------------------------------------------
+static bool LuaProxyCacheGet(lua_State* L, const char* cacheName, lua_Integer key) {
+    lua_getfield(L, LUA_REGISTRYINDEX, cacheName);
+    if (lua_istable(L, -1)) {
+        lua_rawgeti(L, -1, key);
+        if (lua_istable(L, -1)) { lua_remove(L, -2); return true; }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return false;
+}
+
+// expects the proxy at the top of the stack; leaves it there
+static void LuaProxyCachePut(lua_State* L, const char* cacheName, lua_Integer key) {
+    lua_getfield(L, LUA_REGISTRYINDEX, cacheName);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);                       // cache
+        lua_newtable(L);                       // its metatable: { __mode = "v" }
+        lua_pushstring(L, "v");
+        lua_setfield(L, -2, "__mode");
+        lua_setmetatable(L, -2);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, cacheName);
+    }
+    lua_pushvalue(L, -2);
+    lua_rawseti(L, -2, key);
+    lua_pop(L, 1);
+}
+
+static bool LuaProxyCacheGetStr(lua_State* L, const char* cacheName, const std::string& key) {
+    lua_getfield(L, LUA_REGISTRYINDEX, cacheName);
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, key.c_str());
+        if (lua_istable(L, -1)) { lua_remove(L, -2); return true; }
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return false;
+}
+
+static void LuaProxyCachePutStr(lua_State* L, const char* cacheName, const std::string& key) {
+    lua_getfield(L, LUA_REGISTRYINDEX, cacheName);
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        lua_newtable(L);
+        lua_newtable(L);
+        lua_pushstring(L, "v");
+        lua_setfield(L, -2, "__mode");
+        lua_setmetatable(L, -2);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, LUA_REGISTRYINDEX, cacheName);
+    }
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, key.c_str());
+    lua_pop(L, 1);
+}
+
 static void PushMarkerLuaTable(lua_State* L, size_t markerIndex) {
+    if (LuaProxyCacheGet(L, "NexusPathing.MarkerProxies", static_cast<lua_Integer>(markerIndex) + 1)) return;
     lua_newtable(L);
     lua_pushinteger(L, static_cast<lua_Integer>(markerIndex));
     lua_rawsetp(L, -2, reinterpret_cast<const void*>(0x1001));
 
-    // Metatable for live read/write of Marker properties from Lua
-    lua_newtable(L);
+    // Shared metatable (built once per VM) for live read/write of Marker properties from Lua
+    if (luaL_newmetatable(L, "NexusPathing.Marker")) {
     lua_pushcfunction(L, [](lua_State* s) -> int {
         lua_rawgetp(s, 1, reinterpret_cast<const void*>(0x1001));
         int idx = static_cast<int>(lua_tointeger(s, -1));
@@ -1988,8 +2355,10 @@ static void PushMarkerLuaTable(lua_State* L, size_t markerIndex) {
         return 1;
     });
     lua_setfield(L, -2, "__eq");
+    }   // end shared metatable construction
 
     lua_setmetatable(L, -2);
+    LuaProxyCachePut(L, "NexusPathing.MarkerProxies", static_cast<lua_Integer>(markerIndex) + 1);
 }
 
 // Live Trail proxy in Lua (propagates changes to InGameVisibility, Alpha, Tint, Texture, MapVisibility, MiniMapVisibility directly to g_Trails[idx]!)
@@ -2012,7 +2381,7 @@ static int Lua_Trail_SetTexture(lua_State* L) {
             t.TextureId = EnsurePackTextureLoaded(
                 t.PackName.empty() ? g_CurrentPackName : t.PackName,
                 texPath,
-                FetchFromCachedPackFiles,
+                MakePackFetcher(t.PackName.empty() ? g_CurrentPackName : t.PackName),
                 &t.NativeSRV
             );
         }
@@ -2034,11 +2403,12 @@ static int Lua_Trail_Remove(lua_State* L) {
 }
 
 static void PushTrailLuaTable(lua_State* L, size_t trailIndex) {
+    if (LuaProxyCacheGet(L, "NexusPathing.TrailProxies", static_cast<lua_Integer>(trailIndex) + 1)) return;
     lua_newtable(L);
     lua_pushinteger(L, static_cast<lua_Integer>(trailIndex));
     lua_rawsetp(L, -2, reinterpret_cast<const void*>(0x2002));
 
-    lua_newtable(L);
+    if (luaL_newmetatable(L, "NexusPathing.Trail")) {   // shared metatable, built once per VM
     lua_pushcfunction(L, [](lua_State* s) -> int {
         lua_rawgetp(s, 1, reinterpret_cast<const void*>(0x2002));
         int idx = static_cast<int>(lua_tointeger(s, -1));
@@ -2124,26 +2494,14 @@ static void PushTrailLuaTable(lua_State* L, size_t trailIndex) {
         return 1;
     });
     lua_setfield(L, -2, "__eq");
+    }   // end shared metatable construction
 
     lua_setmetatable(L, -2);
+    LuaProxyCachePut(L, "NexusPathing.TrailProxies", static_cast<lua_Integer>(trailIndex) + 1);
 }
 
-static void PushCategoryLuaTable(lua_State* L, const std::string& typePath) {
-    std::string normType = ToLowerAscii(typePath);
-    std::string shortName = normType;
-    auto dotPos = normType.rfind('.');
-    if (dotPos != std::string::npos) shortName = normType.substr(dotPos + 1);
-    std::string dispName = shortName;
-    auto catIt = g_CategoryLookup.find(normType);
-    if (catIt != g_CategoryLookup.end() && catIt->second) {
-        dispName = catIt->second->DisplayName;
-        shortName = catIt->second->Name;
-    }
-
-    lua_newtable(L);
-    lua_pushstring(L, normType.c_str());  lua_setfield(L, -2, "Namespace");
-    lua_pushstring(L, shortName.c_str()); lua_setfield(L, -2, "Name");
-    lua_pushstring(L, dispName.c_str());  lua_setfield(L, -2, "DisplayName");
+// Category methods live in ONE table shared by every category proxy (expects the target table at the stack top).
+static void FillCategoryMethods(lua_State* L) {
 
     lua_pushcfunction(L, [](lua_State* s) -> int {
         lua_getfield(s, 1, "Namespace");
@@ -2240,6 +2598,34 @@ static void PushCategoryLuaTable(lua_State* L, const std::string& typePath) {
     lua_setfield(L, -2, "GetOrAddCategoryFromNamespace");
 }
 
+static void PushCategoryLuaTable(lua_State* L, const std::string& typePath) {
+    std::string normType = ToLowerAscii(typePath);
+    std::string shortName = normType;
+    auto dotPos = normType.rfind('.');
+    if (dotPos != std::string::npos) shortName = normType.substr(dotPos + 1);
+    std::string dispName = shortName;
+    auto catIt = g_CategoryLookup.find(normType);
+    if (catIt != g_CategoryLookup.end() && catIt->second) {
+        dispName = catIt->second->DisplayName;
+        shortName = catIt->second->Name;
+    }
+
+    if (LuaProxyCacheGetStr(L, "NexusPathing.CategoryProxies", normType)) return;
+
+    lua_newtable(L);
+    lua_pushstring(L, normType.c_str());  lua_setfield(L, -2, "Namespace");
+    lua_pushstring(L, shortName.c_str()); lua_setfield(L, -2, "Name");
+    lua_pushstring(L, dispName.c_str());  lua_setfield(L, -2, "DisplayName");
+
+    if (luaL_newmetatable(L, "NexusPathing.Category")) {
+        lua_newtable(L);
+        FillCategoryMethods(L);
+        lua_setfield(L, -2, "__index");
+    }
+    lua_setmetatable(L, -2);
+    LuaProxyCachePutStr(L, "NexusPathing.CategoryProxies", normType);
+}
+
 static std::string ExtractGuidArg(lua_State* L, int argIdx) {
     if (lua_istable(L, argIdx)) {
         lua_getfield(L, argIdx, "__guid");
@@ -2306,11 +2692,14 @@ static int Lua_Pack_Require(lua_State* L) {
     return Lua_Require(L);
 }
 
+static uint64_t g_LuaMarkerSeq = 0;   // reset together with the VM so re-running pack.lua yields the same GUIDs
+
 static int Lua_Pack_CreateMarker(lua_State* L) {
     int attrIdx = lua_istable(L, 2) ? 2 : (lua_istable(L, 1) ? 1 : 0);
     RuntimeMarker m{};
     m.PackName = g_CurrentPackName;
-    m.Guid = "lua_marker_" + std::to_string(g_Markers.size());
+    m.FromLua = true;
+    m.Guid = "lua_marker_" + std::to_string(g_LuaMarkerSeq++);
     if (g_Mumble) {
         m.MapId = static_cast<int32_t>(g_Mumble->Context.MapID);
         m.Position = { g_Mumble->AvatarPosition.X, g_Mumble->AvatarPosition.Y, g_Mumble->AvatarPosition.Z };
@@ -2354,7 +2743,7 @@ static int Lua_Pack_CreateMarker(lua_State* L) {
                     if (const char* s = lua_tostring(L, -1)) {
                         m.IconFileRelative = s;
                         m.IconTextureId = EnsurePackTextureLoaded(
-                            m.PackName, m.IconFileRelative, FetchFromCachedPackFiles, &m.NativeSRV
+                            m.PackName, m.IconFileRelative, MakePackFetcher(m.PackName), &m.NativeSRV
                         );
                     }
                 }
@@ -2442,11 +2831,13 @@ static std::unordered_map<std::string, std::string> g_LuaStorageKV;
 
 static int Lua_Storage_ReadValue(lua_State* L) {
     int startIdx = lua_istable(L, 1) ? 2 : 1;
-    std::string ns  = luaL_optstring(L, startIdx, "");
-    std::string key = luaL_optstring(L, startIdx + 1, "");
-    auto it = g_LuaStorageKV.find(ns + ":" + key);
+    // Fetch ALL C strings first: luaL_optstring can longjmp, which would skip destructors of live std::strings.
+    const char* nsC  = luaL_optstring(L, startIdx, "");
+    const char* keyC = luaL_optstring(L, startIdx + 1, "");
+    if (!IsSafeConfigToken(nsC) || !IsSafeConfigToken(keyC)) { lua_pushnil(L); return 1; }
+    auto it = g_LuaStorageKV.find(std::string(nsC) + ":" + keyC);
     if (it != g_LuaStorageKV.end()) {
-        lua_pushstring(L, it->second.c_str());
+        lua_pushlstring(L, it->second.data(), it->second.size());
     } else {
         lua_pushnil(L);
     }
@@ -2455,11 +2846,27 @@ static int Lua_Storage_ReadValue(lua_State* L) {
 
 static int Lua_Storage_UpsertValue(lua_State* L) {
     int startIdx = lua_istable(L, 1) ? 2 : 1;
-    std::string ns  = luaL_optstring(L, startIdx, "");
-    std::string key = luaL_optstring(L, startIdx + 1, "");
-    std::string val = luaL_optstring(L, startIdx + 2, "");
-    g_LuaStorageKV[ns + ":" + key] = val;
-    SaveConfigToDisk();
+    const char* nsC  = luaL_optstring(L, startIdx, "");
+    const char* keyC = luaL_optstring(L, startIdx + 1, "");
+    size_t valLen = 0;
+    const char* valC = luaL_optlstring(L, startIdx + 2, "", &valLen);
+
+    // Keys are written to config.ini as "key=value" lines: a key containing a newline could inject sections/settings.
+    if (!IsSafeConfigToken(nsC) || !IsSafeConfigToken(keyC)) {
+        PushLuaLogThrottled("Storage:UpsertValue rejected: namespace/key must not contain control characters or '='");
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    constexpr size_t kMaxValueBytes = 64 * 1024;
+    constexpr size_t kMaxEntries    = 2048;
+    std::string fullKey = std::string(nsC) + ":" + keyC;
+    if (valLen > kMaxValueBytes || (g_LuaStorageKV.size() >= kMaxEntries && !g_LuaStorageKV.count(fullKey))) {
+        PushLuaLogThrottled("Storage:UpsertValue rejected (value > 64 KB or more than 2048 keys)");
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    g_LuaStorageKV[fullKey].assign(valC, valLen);
+    g_PendingSaveConfigOnMainThread.store(true);   // coalesced; was a synchronous disk write on every call
     lua_pushboolean(L, 1);
     return 1;
 }
@@ -2484,8 +2891,67 @@ static void InitLuaVM() {
     }
     g_LuaTickRefs.clear();
 
+    g_LuaMarkerSeq   = 0;
+    g_LuaHookCounter = 0;
+    g_LuaCallDepth   = 0;
+
     g_Lua = luaL_newstate();
+    if (!g_Lua) {
+        PushLuaLog("luaL_newstate failed (out of memory)", LOGL_CRITICAL);
+        return;
+    }
+#ifndef NP_LUA_UNSANDBOXED
+    // Packs are untrusted downloads: do NOT expose io / os / debug / package / dofile / loadfile.
+    {
+        static const luaL_Reg kSafeLibs[] = {
+            { LUA_GNAME,      luaopen_base },
+            { LUA_COLIBNAME,  luaopen_coroutine },
+            { LUA_TABLIBNAME, luaopen_table },
+            { LUA_STRLIBNAME, luaopen_string },
+            { LUA_MATHLIBNAME,luaopen_math },
+            { LUA_UTF8LIBNAME,luaopen_utf8 },
+            { LUA_OSLIBNAME,  luaopen_os },      // trimmed below to time/clock/date/difftime
+            { nullptr, nullptr }
+        };
+        for (const luaL_Reg* lib = kSafeLibs; lib->func; ++lib) {
+            luaL_requiref(g_Lua, lib->name, lib->func, 1);
+            lua_pop(g_Lua, 1);
+        }
+    }
+    if (luaL_dostring(g_Lua, R"(
+        dofile, loadfile = nil, nil
+        for _, k in ipairs({"execute","exit","remove","rename","tmpname","getenv","setlocale"}) do os[k] = nil end
+        -- force text-only chunks (no precompiled bytecode) while keeping the standard signature
+        local _load = load
+        load = function(chunk, name, mode, ...) return _load(chunk, name, "t", ...) end
+        -- some Blish scripts probe package.loaded; give them a harmless stub
+        package = { loaded = {}, path = "", cpath = "" }
+    )") != LUA_OK) {
+        PushLuaLog("Lua sandbox prelude failed: " + LuaErrStr(g_Lua), LOGL_WARNING);
+        lua_pop(g_Lua, 1);
+    }
+#else
     luaL_openlibs(g_Lua);
+#endif
+    lua_pushcfunction(g_Lua, Lua_BudgetTripped);
+    lua_setglobal(g_Lua, "__np_tripped");
+    if (luaL_dostring(g_Lua, R"NPLUA(
+        local tripped = __np_tripped
+        __np_tripped = nil
+        local function guard(ok, ...)
+            if not ok and tripped() then error("script exceeded instruction budget (possible infinite loop)", 0) end
+            return ok, ...
+        end
+        local _pcall, _xpcall, _resume = pcall, xpcall, coroutine.resume
+        pcall  = function(f, ...) return guard(_pcall(f, ...)) end
+        xpcall = function(f, h, ...) return guard(_xpcall(f, h, ...)) end
+        coroutine.resume = function(co, ...) return guard(_resume(co, ...)) end
+    )NPLUA") != LUA_OK) {
+        PushLuaLog("Lua budget guard failed: " + LuaErrStr(g_Lua), LOGL_WARNING);
+        lua_pop(g_Lua, 1);
+    }
+    lua_gc(g_Lua, LUA_GCGEN, 0, 0);   // generational GC (stable in 5.4.7): cheap minor collections for per-frame temp tables
+    lua_sethook(g_Lua, LuaBudgetHook, LUA_MASKCOUNT, LUA_HOOK_STEP);
 
     // Global PathingVersion & Pathing object (required by xrandox_TehsTrails.taco & Blish HUD scripts!)
     lua_pushstring(g_Lua, "1.13.2");
@@ -2502,7 +2968,7 @@ static void InitLuaVM() {
 
     // Add real recursive table.ToLson, table.FromLson, and string:ToBase64() so both `marker.Guid .. "text"`
     // and `trail.Guid:ToBase64()` work natively in Lua 5.4!
-    luaL_dostring(g_Lua, R"(
+    if (luaL_dostring(g_Lua, R"(
         if string then
             string.ToBase64 = function(self) return self end
         end
@@ -2536,7 +3002,10 @@ static void InitLuaVM() {
                 return {}
             end
         end
-    )");
+    )") != LUA_OK) {
+        PushLuaLog("Lua prelude failed: " + LuaErrStr(g_Lua), LOGL_WARNING);
+        lua_pop(g_Lua, 1);
+    }
 
     // Override print and require
     lua_pushcfunction(g_Lua, Lua_DebugPrint);
@@ -2747,8 +3216,8 @@ static void InvokeMarkerLuaScript(
         }
     }
 
-    if (lua_pcall(g_Lua, nargs, 0, 0) != LUA_OK) {
-        PushLuaLog(std::string("Marker script error (") + fnName + "): " + lua_tostring(g_Lua, -1), LOGL_WARNING);
+    if (LuaSafeCall(g_Lua, nargs, 0) != LUA_OK) {
+        PushLuaLogThrottled("Marker script error (" + fnName + "): " + LuaErrStr(g_Lua));
         lua_pop(g_Lua, 1);
     }
 }
@@ -2847,29 +3316,35 @@ static void UpdateLuaMumbleGlobals(double totalSeconds, double deltaSeconds) {
     }
     lua_pop(g_Lua, 1);
 
-    // Execute registered Event:OnTick(gameTime) listeners with Blish HUD GameTime structure
-    for (int ref : g_LuaTickRefs) {
-        lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, ref);
-        if (lua_isfunction(g_Lua, -1)) {
-            lua_newtable(g_Lua);
+    // Execute registered Event:OnTick(gameTime) listeners with Blish HUD GameTime structure.
+    // Index loop + by-value ref: a handler may call Event:OnTick(...) and push_back into g_LuaTickRefs,
+    // which invalidated the iterators of the previous range-for (undefined behaviour).
+    if (!g_LuaTickRefs.empty()) {
+        lua_newtable(g_Lua);
+        lua_newtable(g_Lua);
+        lua_pushnumber(g_Lua, totalSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
+        lua_pushnumber(g_Lua, totalSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
+        lua_setfield(g_Lua, -2, "TotalGameTime");
+        lua_newtable(g_Lua);
+        lua_pushnumber(g_Lua, deltaSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
+        lua_pushnumber(g_Lua, deltaSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
+        lua_setfield(g_Lua, -2, "ElapsedGameTime");
+        const int gameTimeIdx = lua_gettop(g_Lua);
 
-            lua_newtable(g_Lua);
-            lua_pushnumber(g_Lua, totalSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
-            lua_pushnumber(g_Lua, totalSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
-            lua_setfield(g_Lua, -2, "TotalGameTime");
-
-            lua_newtable(g_Lua);
-            lua_pushnumber(g_Lua, deltaSeconds); lua_setfield(g_Lua, -2, "TotalSeconds");
-            lua_pushnumber(g_Lua, deltaSeconds * 1000.0); lua_setfield(g_Lua, -2, "TotalMilliseconds");
-            lua_setfield(g_Lua, -2, "ElapsedGameTime");
-
-            if (lua_pcall(g_Lua, 1, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("Event:OnTick runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+        for (size_t i = 0; i < g_LuaTickRefs.size(); ++i) {
+            const int ref = g_LuaTickRefs[i];
+            lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, ref);
+            if (lua_isfunction(g_Lua, -1)) {
+                lua_pushvalue(g_Lua, gameTimeIdx);
+                if (LuaSafeCall(g_Lua, 1, 0) != LUA_OK) {
+                    PushLuaLogThrottled("Event:OnTick runtime error: " + LuaErrStr(g_Lua));
+                    lua_pop(g_Lua, 1);
+                }
+            } else {
                 lua_pop(g_Lua, 1);
             }
-        } else {
-            lua_pop(g_Lua, 1);
         }
+        lua_settop(g_Lua, gameTimeIdx - 1);   // guarantees no stack growth across frames, whatever the handlers did
     }
 
     // High-performance CPU throttling: Run marker trigger/distance loop at 40Hz (25ms)
@@ -2880,6 +3355,11 @@ static void UpdateLuaMumbleGlobals(double totalSeconds, double deltaSeconds) {
         return;
     }
     s_LastMarkerCheckTick = currentTick;
+    // Scripts get the time that really elapsed since the previous marker pass (this loop runs every 25 ms, not every
+    // frame; passing the per-frame delta made delta-integrating scripts run ~3.5x too slow at 144 fps).
+    static double s_LastMarkerCheckSeconds = 0.0;
+    const double scriptDelta = std::clamp(totalSeconds - s_LastMarkerCheckSeconds, 0.001, 0.25);
+    s_LastMarkerCheckSeconds = totalSeconds;
 
     // Update marker focus state and execute script-once, script-focus, autoTrigger, and script-tick
     int32_t currentMapId = static_cast<int32_t>(g_Mumble->Context.MapID);
@@ -2920,7 +3400,7 @@ static void UpdateLuaMumbleGlobals(double totalSeconds, double deltaSeconds) {
 
         if (!g_Markers[i].ScriptTick.empty() && g_Markers[i].IsVisible) {
             std::string expr = g_Markers[i].ScriptTick;
-            InvokeMarkerLuaScript(i, expr, 2, false, totalSeconds, deltaSeconds);
+            InvokeMarkerLuaScript(i, expr, 2, false, totalSeconds, scriptDelta);
         }
     }
 }
@@ -2951,9 +3431,8 @@ static CategoryNode* FindOrCreateCategoryChild(
     const std::string& name,
     const std::string& fullPath)
 {
-    std::string lowerName = ToLowerAscii(name);
     for (auto& c : list) {
-        if (ToLowerAscii(c->Name) == lowerName) {
+        if (EqualsIgnoreCaseAscii(c->Name, name)) {
             return c.get();
         }
     }
@@ -2972,8 +3451,10 @@ static void ParseXmlCategoryRecursive(
     const std::string& parentFullPath,
     const AttributeMap& inheritedAttrs,
     std::vector<std::unique_ptr<CategoryNode>>& targetList,
-    bool parentEnabled = true)
+    bool parentEnabled = true,
+    int depth = 0)
 {
+    if (depth > 64) return;   // hostile XML could otherwise nest categories until the stack overflows
     AttributeMap localAttrs = ExtractXmlNodeAttributes(xmlNode);
     std::string name = localAttrs["name"];
     if (name.empty()) return;
@@ -2999,7 +3480,7 @@ static void ParseXmlCategoryRecursive(
 
     for (pugi::xml_node child : xmlNode.children()) {
         if (ToLowerAscii(child.name()) == "markercategory") {
-            ParseXmlCategoryRecursive(child, fullPath, merged, cat->Children, cat->Enabled);
+            ParseXmlCategoryRecursive(child, fullPath, merged, cat->Children, cat->Enabled, depth + 1);
         }
     }
 }
@@ -3012,6 +3493,7 @@ static std::string EnsurePackTextureLoaded(
     const ArchiveFileFetcher& fetchFile,
     ID3D11ShaderResourceView** outNativeSRV)
 {
+    g_TexLoadDeferred = false;
     if (relTexturePath.empty()) return "";
     std::string normRel = NormalizeArchivePath(relTexturePath);
     std::string texId   = "NP_TEX_" + packName + "_" + normRel;
@@ -3023,10 +3505,28 @@ static std::string EnsurePackTextureLoaded(
         return texId;
     }
 
-    std::vector<uint8_t> imgBytes;
-    if (!fetchFile(normRel, imgBytes) || imgBytes.empty()) {
+    if (g_MissingTextureIds.count(texId)) return "";
+
+    // Spread first-use loads (zip open + decode + GPU upload) over several frames instead of one long hitch.
+    if (g_TextureBudgetActive && g_TextureLoadsThisFrame >= kMaxTextureLoadsPerFrame) {
+        g_TexLoadDeferred = true;
+        g_TexLoadDeferDelayMs = 0;
         return "";
     }
+
+    std::vector<uint8_t> imgBytes;
+    g_FetchTransientFailure = false;
+    if (!fetchFile(normRel, imgBytes) || imgBytes.empty()) {
+        if (g_FetchTransientFailure) {            // archive locked / being updated: do NOT remember it as missing
+            g_FetchTransientFailure = false;
+            g_TexLoadDeferred = true;
+            g_TexLoadDeferDelayMs = 3000;
+            return "";
+        }
+        g_MissingTextureIds.insert(texId);
+        return "";
+    }
+    ++g_TextureLoadsThisFrame;
 
     g_UploadedTextureIds.insert(texId);
     ID3D11ShaderResourceView* nativeSrv = g_D3DEngine.LoadTextureFromMemory(texId, imgBytes.data(), imgBytes.size());
@@ -3047,72 +3547,82 @@ static std::string EnsurePackTextureLoaded(
 }
 
 static bool FetchFileFromLoadedPackArchive(const std::string& packName, const std::string& relPath, std::vector<uint8_t>& outBytes) {
-    // 1. Check in-memory cached pack files first
-    if (FetchFromCachedPackFiles(relPath, outBytes)) {
-        return true;
-    }
-
-    // 2. Lazy-load directly from the .taco / .zip archive or loose file on disk when needed for rendering!
-    //    This avoids extracting & decoding thousands of textures from other maps at startup, saving >300 MB of RAM & VRAM!
-    std::string lowPack = ToLowerAscii(packName);
-    std::string fullArchivePath;
-    for (const auto& p : g_LoadedPacks) {
-        if (ToLowerAscii(p.Filename) == lowPack) {
-            fullArchivePath = p.FullPath;
-            break;
+    // Lazy-load directly from the .taco / .zip archive or loose file on disk when needed for rendering.
+    // This avoids extracting & decoding thousands of textures from other maps at startup, saving >300 MB of RAM & VRAM.
+    const std::string lowPack = ToLowerAscii(packName);
+    std::string fullArchivePath;   // UTF-8
+    if (!g_LoadingPackFullPath.empty() && ToLowerAscii(g_LoadingPackName) == lowPack) {
+        fullArchivePath = g_LoadingPackFullPath;          // pack.lua is running during its own load
+    } else {
+        for (const auto& p : g_LoadedPacks) {
+            if (ToLowerAscii(p.Filename) == lowPack) {
+                fullArchivePath = p.FullPath;
+                break;
+            }
         }
     }
     if (fullArchivePath.empty()) return false;
 
-    std::filesystem::path fsPath(fullArchivePath);
-    std::string ext = ToLowerAscii(fsPath.extension().string());
+    const std::filesystem::path fsPath = PathFromUtf8(fullArchivePath);
+    const std::string ext = ToLowerAscii(PathToUtf8(fsPath.extension()));
     if (ext == ".taco" || ext == ".zip") {
         mz_zip_archive zip{};
-        if (!mz_zip_reader_init_file(&zip, fullArchivePath.c_str(), 0)) return false;
+        if (!mz_zip_reader_init_file(&zip, fullArchivePath.c_str(), 0)) {
+            g_FetchTransientFailure = true;      // locked by another process or mid-update: caller retries later
+            return false;
+        }
 
-        std::string norm = NormalizeArchivePath(relPath);
+        const std::string norm = NormalizeArchivePath(relPath);
         int foundIdx = mz_zip_reader_locate_file(&zip, norm.c_str(), nullptr, 0);
         if (foundIdx < 0) {
-            std::string baseName = std::filesystem::path(norm).filename().string();
-            mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
+            // One pass: an exact normalized match wins; otherwise the lexicographically smallest entry that has the
+            // same file name (deterministic, and no per-entry std::filesystem::path construction).
+            const std::string baseName = BaseNameOf(norm);
+            std::string bestName;
+            const mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
             for (mz_uint i = 0; i < numFiles; ++i) {
                 mz_zip_archive_file_stat st{};
                 if (!mz_zip_reader_file_stat(&zip, i, &st) || st.m_is_directory) continue;
-                std::string entryNorm = NormalizeArchivePath(st.m_filename);
-                if (entryNorm == norm || std::filesystem::path(entryNorm).filename().string() == baseName) {
+                const std::string entryNorm = NormalizeArchivePath(st.m_filename);
+                if (entryNorm == norm) { foundIdx = static_cast<int>(i); break; }
+                if (BaseNameOf(entryNorm) == baseName && (foundIdx < 0 || entryNorm < bestName)) {
                     foundIdx = static_cast<int>(i);
-                    break;
+                    bestName = entryNorm;
                 }
             }
         }
         bool ok = false;
         if (foundIdx >= 0) {
             size_t uncompSize = 0;
-            void* pData = mz_zip_reader_extract_to_heap(&zip, static_cast<mz_uint>(foundIdx), &uncompSize, 0);
-            if (pData && uncompSize > 0) {
-                outBytes.assign(static_cast<uint8_t*>(pData), static_cast<uint8_t*>(pData) + uncompSize);
+            void* pData = ExtractEntryCapped(&zip, static_cast<mz_uint>(foundIdx), kMaxImageBytes, &uncompSize);
+            if (pData) {
+                if (uncompSize > 0) {
+                    outBytes.assign(static_cast<uint8_t*>(pData), static_cast<uint8_t*>(pData) + uncompSize);
+                    ok = true;
+                }
                 mz_free(pData);
-                ok = true;
             }
         }
         mz_zip_reader_end(&zip);
         return ok;
     } else {
-        std::filesystem::path looseFile = fsPath.parent_path() / relPath;
+        // Loose pack: normalized relative path (never contains ".." or a drive letter, see NormalizeArchivePath)
+        const std::filesystem::path looseFile = fsPath.parent_path() / PathFromUtf8(NormalizeArchivePath(relPath));
         std::ifstream ifs(looseFile, std::ios::binary | std::ios::ate);
         if (!ifs) return false;
-        auto sz = ifs.tellg();
-        if (sz <= 0) return false;
+        const auto sz = ifs.tellg();
+        if (sz <= 0 || static_cast<size_t>(sz) > kMaxImageBytes) return false;
         outBytes.resize(static_cast<size_t>(sz));
         ifs.seekg(0);
         ifs.read(reinterpret_cast<char*>(outBytes.data()), sz);
-        return true;
+        return ifs.good() || ifs.gcount() == sz;
     }
 }
 
 static ID3D11ShaderResourceView* ResolveMarkerSRV(RuntimeMarker& m) {
     if (m.NativeSRV) return m.NativeSRV;
     if (!m.IconFileRelative.empty() && m.IconTextureId.empty()) {
+        if (m.TexRetryAtMs && GetTickCount64() < m.TexRetryAtMs) return nullptr;
         std::string packName = m.PackName;
         m.IconTextureId = EnsurePackTextureLoaded(
             packName,
@@ -3123,7 +3633,14 @@ static ID3D11ShaderResourceView* ResolveMarkerSRV(RuntimeMarker& m) {
             &m.NativeSRV
         );
         if (m.IconTextureId.empty()) {
+            if (g_TexLoadDeferred) {              // over the per-frame budget or archive temporarily unreadable
+                g_TexLoadDeferred = false;
+                m.TexRetryAtMs = GetTickCount64() + g_TexLoadDeferDelayMs;
+                return nullptr;
+            }
             m.IconTextureId = "__FAILED__";
+        } else {
+            m.TexRetryAtMs = 0;
         }
     }
     if (m.NativeSRV) return m.NativeSRV;
@@ -3140,6 +3657,7 @@ static ID3D11ShaderResourceView* ResolveMarkerSRV(RuntimeMarker& m) {
 static ID3D11ShaderResourceView* ResolveTrailSRV(RuntimeTrail& t) {
     if (t.NativeSRV) return t.NativeSRV;
     if (!t.TextureRelative.empty() && t.TextureId.empty()) {
+        if (t.TexRetryAtMs && GetTickCount64() < t.TexRetryAtMs) return nullptr;
         std::string packName = t.PackName;
         t.TextureId = EnsurePackTextureLoaded(
             packName,
@@ -3150,7 +3668,14 @@ static ID3D11ShaderResourceView* ResolveTrailSRV(RuntimeTrail& t) {
             &t.NativeSRV
         );
         if (t.TextureId.empty()) {
+            if (g_TexLoadDeferred) {
+                g_TexLoadDeferred = false;
+                t.TexRetryAtMs = GetTickCount64() + g_TexLoadDeferDelayMs;
+                return nullptr;
+            }
             t.TextureId = "__FAILED__";
+        } else {
+            t.TexRetryAtMs = 0;
         }
     }
     if (t.NativeSRV) return t.NativeSRV;
@@ -3170,11 +3695,20 @@ static void ParseOverlayXmlDocument(
     const std::string& packName,
     const ArchiveFileFetcher& fetchFile,
     LoadedPackSummary& summary,
-    bool categoriesPassOnly = false)
+    bool categoriesPassOnly = false,
+    bool parseCategoriesInline = true)
 {
     pugi::xml_document doc;
     pugi::xml_parse_result res = doc.load_buffer(xmlBuffer, xmlSize);
-    if (!res) return;
+    if (!res) {
+        // One stray '&' used to drop a whole POI file without any trace. Report it (once: pass 2 / loose mode only).
+        if (!categoriesPassOnly && g_API && g_API->Log) {
+            const std::string msg = "XML parse error in " + packName + " at byte " + std::to_string(static_cast<long long>(res.offset)) +
+                                    ": " + res.description() + " (file skipped)";
+            g_API->Log(LOGL_WARNING, "NexusPathing", msg.c_str());
+        }
+        return;
+    }
 
     pugi::xml_node root = doc.document_element();
     if (!root) return;
@@ -3191,10 +3725,12 @@ static void ParseOverlayXmlDocument(
 
     summary.XmlCount++;
 
-    // Also parse MarkerCategory in single-pass loose XML mode if not already parsed
-    for (pugi::xml_node child : root.children()) {
-        if (ToLowerAscii(child.name()) == "markercategory") {
-            ParseXmlCategoryRecursive(child, "", {}, g_RootCategories, true);
+    // Single-pass (loose XML) mode has no separate category pass; archive pass 2 must not parse categories again.
+    if (parseCategoriesInline) {
+        for (pugi::xml_node child : root.children()) {
+            if (ToLowerAscii(child.name()) == "markercategory") {
+                ParseXmlCategoryRecursive(child, "", {}, g_RootCategories, true);
+            }
         }
     }
 
@@ -3243,9 +3779,10 @@ static void ParseOverlayXmlDocument(
                 m.ResetLengthSec    = SafeParseInt(attrs["resetlength"], 0);
                 m.AchievementId     = SafeParseInt(attrs["achievementid"], 0);
                 m.AchievementBit    = SafeParseInt(attrs["achievementbit"], -1);
+                const bool hasTriggerRange = attrs.count("triggerrange") > 0 && !attrs["triggerrange"].empty();   // operator[] below would insert the key
                 m.TriggerRange      = SafeParseFloat(attrs["triggerrange"], 8.0f);
                 m.InfoRange         = SafeParseFloat(attrs["inforange"], 20.0f);
-                if (!attrs.count("triggerrange") && attrs.count("inforange")) {
+                if (!hasTriggerRange && attrs.count("inforange")) {
                     m.TriggerRange  = m.InfoRange;
                 }
                 m.AutoTrigger       = SafeParseBool(attrs["autotrigger"], false);
@@ -3255,6 +3792,7 @@ static void ParseOverlayXmlDocument(
                 else if (attrs.count("togglecategory")) m.ShowHideCategory = attrs["togglecategory"];
                 else if (attrs.count("showhide")) m.ShowHideCategory = attrs["showhide"];
                 m.InfoText          = attrs.count("info") ? attrs["info"] : attrs["tip-name"];
+                if (m.InfoText.size() > 4096) m.InfoText.resize(4096);   // hint text is measured and drawn every frame
 
                 if (attrs.count("mount")) {
                     std::string mnt = ToLowerAscii(attrs["mount"]);
@@ -3336,18 +3874,25 @@ static void ParseOverlayXmlDocument(
 
 static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
     mz_zip_archive zip{};
-    if (!mz_zip_reader_init_file(&zip, archivePath.string().c_str(), 0)) {
+    const std::string archivePathUtf8 = PathToUtf8(archivePath);   // miniz expects UTF-8 (ANSI .string() broke non-ASCII folders)
+    if (!mz_zip_reader_init_file(&zip, archivePathUtf8.c_str(), 0)) {
+        if (g_API && g_API->Log) {
+            const std::string msg = "Could not open pack (unreadable or not a zip): " + archivePathUtf8;
+            g_API->Log(LOGL_WARNING, "NexusPathing", msg.c_str());
+        }
         return;
     }
 
     LoadedPackSummary summary{};
-    summary.Filename = archivePath.filename().string();
-    summary.FullPath = archivePath.string();
+    summary.Filename = PathToUtf8(archivePath.filename());
+    summary.FullPath = archivePathUtf8;
+    LoadingPackScope loadingScope(summary.Filename, summary.FullPath);
 
     std::unordered_map<std::string, mz_uint> entryLookup;
     std::vector<mz_uint> xmlIndices;
     std::vector<mz_uint> trlIndices;
     std::vector<std::pair<std::string, mz_uint>> luaEntries;
+    std::unordered_map<std::string, std::string> baseIndex;   // file name -> smallest normalized path (built once, O(1) fallback)
 
     mz_uint numFiles = mz_zip_reader_get_num_files(&zip);
     for (mz_uint i = 0; i < numFiles; ++i) {
@@ -3357,6 +3902,11 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
 
         std::string normName = NormalizeArchivePath(st.m_filename);
         entryLookup[normName] = i;
+        {
+            const std::string base = BaseNameOf(normName);
+            auto bi = baseIndex.find(base);
+            if (bi == baseIndex.end() || normName < bi->second) baseIndex[base] = normName;
+        }
 
         if (normName.size() >= 4 && normName.substr(normName.size() - 4) == ".xml") {
             xmlIndices.push_back(i);
@@ -3368,21 +3918,16 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
     }
 
     auto fetchFileFromZip = [&](const std::string& relPath, std::vector<uint8_t>& outBytes) -> bool {
-        std::string norm = NormalizeArchivePath(relPath);
+        const std::string norm = NormalizeArchivePath(relPath);
         auto it = entryLookup.find(norm);
         if (it == entryLookup.end()) {
-            std::string baseName = std::filesystem::path(norm).filename().string();
-            for (const auto& [k, idx] : entryLookup) {
-                if (std::filesystem::path(k).filename().string() == baseName) {
-                    it = entryLookup.find(k);
-                    break;
-                }
-            }
+            auto bi = baseIndex.find(BaseNameOf(norm));       // same file name in another folder (deterministic pick)
+            if (bi != baseIndex.end()) it = entryLookup.find(bi->second);
         }
         if (it == entryLookup.end()) return false;
 
         size_t uncompSize = 0;
-        void* pData = mz_zip_reader_extract_to_heap(&zip, it->second, &uncompSize, 0);
+        void* pData = ExtractEntryCapped(&zip, it->second, kMaxImageBytes, &uncompSize);
         if (!pData) return false;
 
         outBytes.assign(static_cast<uint8_t*>(pData), static_cast<uint8_t*>(pData) + uncompSize);
@@ -3393,9 +3938,9 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
     // Pass 1: Parse all <MarkerCategory> trees across all XML files in the .taco archive
     for (mz_uint xmlIdx : xmlIndices) {
         size_t xmlSize = 0;
-        void* pXml = mz_zip_reader_extract_to_heap(&zip, xmlIdx, &xmlSize, 0);
-        if (pXml && xmlSize > 0) {
-            ParseOverlayXmlDocument(static_cast<const char*>(pXml), xmlSize, summary.Filename, fetchFileFromZip, summary, true);
+        void* pXml = ExtractEntryCapped(&zip, xmlIdx, kMaxXmlBytes, &xmlSize);
+        if (pXml) {
+            if (xmlSize > 0) ParseOverlayXmlDocument(static_cast<const char*>(pXml), xmlSize, summary.Filename, fetchFileFromZip, summary, true);
             mz_free(pXml);
         }
     }
@@ -3403,61 +3948,50 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
     // Pass 2: Parse all <POI> and <Trail> elements with complete category inheritance
     for (mz_uint xmlIdx : xmlIndices) {
         size_t xmlSize = 0;
-        void* pXml = mz_zip_reader_extract_to_heap(&zip, xmlIdx, &xmlSize, 0);
-        if (pXml && xmlSize > 0) {
-            ParseOverlayXmlDocument(static_cast<const char*>(pXml), xmlSize, summary.Filename, fetchFileFromZip, summary, false);
+        void* pXml = ExtractEntryCapped(&zip, xmlIdx, kMaxXmlBytes, &xmlSize);
+        if (pXml) {
+            if (xmlSize > 0) ParseOverlayXmlDocument(static_cast<const char*>(pXml), xmlSize, summary.Filename, fetchFileFromZip, summary, false, false);
             mz_free(pXml);
         }
     }
 
-    // Only extract binary images for packs that actually contain Lua scripts (e.g. TehsTrails),
-    // while standard XML/.taco packs lazy-load textures on demand per map!
-    g_CurrentPackName = summary.Filename;
-    if (!luaEntries.empty()) {
-        for (mz_uint i = 0; i < numFiles; ++i) {
-            mz_zip_archive_file_stat st{};
-            if (!mz_zip_reader_file_stat(&zip, i, &st) || st.m_is_directory) continue;
-            std::string normName = NormalizeArchivePath(st.m_filename);
-            if (normName.size() >= 4) {
-                std::string ext = normName.substr(normName.size() - 4);
-                if (ext == ".png" || ext == ".jpg" || ext == ".dds" || ext == ".bmp" || ext == ".tga") {
-                    size_t binSize = 0;
-                    void* pBin = mz_zip_reader_extract_to_heap(&zip, i, &binSize, 0);
-                    if (pBin && binSize > 0) {
-                        const auto* bPtr = static_cast<const uint8_t*>(pBin);
-                        g_PackBinaryFiles[normName] = std::vector<uint8_t>(bPtr, bPtr + binSize);
-                        mz_free(pBin);
-                    }
-                }
-            }
-        }
-    }
+    g_CurrentPackName = summary.Filename;   // images are read lazily on first use (see MakePackFetcher)
 
     std::unordered_map<std::string, std::string> thisPackLua;
     for (const auto& [luaPath, luaIdx] : luaEntries) {
         size_t luaSize = 0;
-        void* pLua = mz_zip_reader_extract_to_heap(&zip, luaIdx, &luaSize, 0);
+        void* pLua = ExtractEntryCapped(&zip, luaIdx, kMaxLuaBytes, &luaSize);
         if (pLua && luaSize > 0) {
             std::string code(static_cast<const char*>(pLua), luaSize);
-            g_LuaScriptsInPack[luaPath] = code;
+            g_LuaScriptsInPack[LuaScriptKey(summary.Filename, luaPath)] = code;
             thisPackLua[luaPath] = std::move(code);
-            mz_free(pLua);
             summary.LuaCount++;
         }
+        if (pLua) mz_free(pLua);
     }
 
-    if (g_Lua && thisPackLua.count("pack.lua")) {
-        const std::string& packLua = thisPackLua["pack.lua"];
-        g_PackEntryLuaScripts.push_back({ summary.Filename, packLua });
-        if (luaL_loadbuffer(g_Lua, packLua.data(), packLua.size(), (summary.Filename + ":pack.lua").c_str()) == LUA_OK) {
-            if (lua_pcall(g_Lua, 0, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("pack.lua runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+    // Entry script: root pack.lua, else the shallowest pack.lua in a sub-folder (some packs nest everything).
+    std::string packLuaKey;
+    if (thisPackLua.count("pack.lua")) {
+        packLuaKey = "pack.lua";
+    } else {
+        for (const auto& [k, code] : thisPackLua) {
+            if (std::filesystem::path(k).filename().string() != "pack.lua") continue;
+            if (packLuaKey.empty() || k.size() < packLuaKey.size()) packLuaKey = k;
+        }
+    }
+    if (g_Lua && !packLuaKey.empty()) {
+        const std::string& packLua = thisPackLua[packLuaKey];
+        g_PackEntryLuaScripts.push_back({ summary.Filename, LuaScriptKey(summary.Filename, packLuaKey) });   // key into g_LuaScriptsInPack, not a 2nd copy
+        if (LuaLoadText(g_Lua, packLua, summary.Filename + ":" + packLuaKey) == LUA_OK) {
+            if (LuaSafeCall(g_Lua, 0, 0) != LUA_OK) {
+                PushLuaLog("pack.lua runtime error: " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             } else {
                 PushLuaLog("Executed pack.lua from " + summary.Filename, LOGL_INFO);
             }
         } else {
-            PushLuaLog(std::string("pack.lua load error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+            PushLuaLog("pack.lua load error: " + LuaErrStr(g_Lua), LOGL_WARNING);
             lua_pop(g_Lua, 1);
         }
     }
@@ -3465,7 +3999,7 @@ static void LoadTacoZipArchive(const std::filesystem::path& archivePath) {
     if (xmlIndices.empty() && !trlIndices.empty()) {
         for (mz_uint trlIdx : trlIndices) {
             size_t uncompSize = 0;
-            void* pData = mz_zip_reader_extract_to_heap(&zip, trlIdx, &uncompSize, 0);
+            void* pData = ExtractEntryCapped(&zip, trlIdx, kMaxTrlBytes, &uncompSize);
             if (!pData) continue;
 
             RuntimeTrail trail{};
@@ -3503,7 +4037,7 @@ static std::filesystem::path GetConfigFilePath() {
 
 static std::filesystem::path GetPrimaryMarkersDirectory() {
     if (!g_ScannedDirectories.empty()) {
-        return std::filesystem::path(g_ScannedDirectories.front());
+        return PathFromUtf8(g_ScannedDirectories.front());
     }
     if (g_API && g_API->Paths_GetAddonDirectory) {
         if (const char* npDir = g_API->Paths_GetAddonDirectory("NexusPathing")) {
@@ -3521,27 +4055,53 @@ static std::filesystem::path GetPrimaryMarkersDirectory() {
 // ============================================================================
 // 8B. WINHTTP HTTPS CLIENT, GW2 API KEY ACHIEVEMENT SYNC & GITHUB TACO MANAGER
 // ============================================================================
-static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint8_t>& outBody, const std::string& bearerToken = "") {
+// Requests currently in flight, so AddonUnload() can abort a blocking download immediately instead of waiting for the
+// network timeout. A request handle is closed exactly once: either by its worker or by CancelActiveHttpRequests().
+static Win32Mutex            g_HttpActiveMutex;
+static std::vector<HINTERNET> g_HttpActiveRequests;
+static void CancelActiveHttpRequests() {
+    Win32LockGuard lock(g_HttpActiveMutex);
+    for (HINTERNET h : g_HttpActiveRequests) WinHttpCloseHandle(h);   // pending WinHttp calls on it fail right away
+    g_HttpActiveRequests.clear();
+}
+
+// HTTPS GET into a buffer.
+//  * outStatus : HTTP status code (0 = no response: DNS/TLS/network failure or cancelled)
+//  * maxBytes  : hard cap on the body (a hostile URL cannot exhaust memory)
+//  * bearerToken is only ever sent over HTTPS and must not contain control characters (header injection).
+// Redirects: WinHTTP's default policy (no https -> http downgrade).
+static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint8_t>& outBody,
+                                    const std::string& bearerToken = "", DWORD* outStatus = nullptr,
+                                    size_t maxBytes = (256u << 20)) {
     outBody.clear();
-    if (fullUrl.empty()) return false;
+    if (outStatus) *outStatus = 0;
+    if (fullUrl.empty() || g_ShuttingDown.load()) return false;
+    for (char c : bearerToken) {
+        if (static_cast<unsigned char>(c) < 32) return false;
+    }
 
     int wLen = MultiByteToWideChar(CP_UTF8, 0, fullUrl.c_str(), -1, nullptr, 0);
-    if (wLen <= 0) return false;
+    if (wLen <= 1) return false;
     std::wstring wUrl(static_cast<size_t>(wLen), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, fullUrl.c_str(), -1, wUrl.data(), wLen);
 
+    // Length -1 + NULL pointers: WinHttpCrackUrl returns pointers INTO wUrl with exact lengths, so host, path and the
+    // query string ("extra info") are never truncated by fixed-size buffers or silently dropped.
     URL_COMPONENTS urlComp{};
-    urlComp.dwStructSize = sizeof(urlComp);
-    wchar_t hostName[256] = {};
-    wchar_t urlPath[2048] = {};
-    urlComp.lpszHostName = hostName;
-    urlComp.dwHostNameLength = 256;
-    urlComp.lpszUrlPath = urlPath;
-    urlComp.dwUrlPathLength = 2048;
-
-    if (!WinHttpCrackUrl(wUrl.c_str(), 0, 0, &urlComp)) {
+    urlComp.dwStructSize      = sizeof(urlComp);
+    urlComp.dwHostNameLength  = static_cast<DWORD>(-1);
+    urlComp.dwUrlPathLength   = static_cast<DWORD>(-1);
+    urlComp.dwExtraInfoLength = static_cast<DWORD>(-1);
+    if (!WinHttpCrackUrl(wUrl.c_str(), 0, 0, &urlComp) || !urlComp.lpszHostName || urlComp.dwHostNameLength == 0) {
         return false;
     }
+    if (!bearerToken.empty() && urlComp.nScheme != INTERNET_SCHEME_HTTPS) return false;   // never send a key in clear text
+
+    const std::wstring hostName(urlComp.lpszHostName, urlComp.dwHostNameLength);
+    std::wstring urlPath;
+    if (urlComp.lpszUrlPath && urlComp.dwUrlPathLength) urlPath.assign(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+    if (urlComp.lpszExtraInfo && urlComp.dwExtraInfoLength) urlPath.append(urlComp.lpszExtraInfo, urlComp.dwExtraInfoLength);
+    if (urlPath.empty()) urlPath = L"/";
 
     HINTERNET hSession = WinHttpOpen(
         L"NexusPathing/3.0 (Raidcore Nexus; Guild Wars 2)",
@@ -3551,22 +4111,19 @@ static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint
         0
     );
     if (!hSession) return false;
-
-    DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
-    WinHttpSetOption(hSession, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy));
     WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 30000);
 
-    HINTERNET hConnect = WinHttpConnect(hSession, hostName, urlComp.nPort, 0);
+    HINTERNET hConnect = WinHttpConnect(hSession, hostName.c_str(), urlComp.nPort, 0);
     if (!hConnect) {
         WinHttpCloseHandle(hSession);
         return false;
     }
 
-    DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    const DWORD flags = (urlComp.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hRequest = WinHttpOpenRequest(
         hConnect,
         L"GET",
-        urlPath,
+        urlPath.c_str(),
         nullptr,
         WINHTTP_NO_REFERER,
         WINHTTP_DEFAULT_ACCEPT_TYPES,
@@ -3576,6 +4133,11 @@ static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint
         WinHttpCloseHandle(hConnect);
         WinHttpCloseHandle(hSession);
         return false;
+    }
+
+    {
+        Win32LockGuard lock(g_HttpActiveMutex);
+        g_HttpActiveRequests.push_back(hRequest);
     }
 
     std::wstring headers = L"User-Agent: NexusPathing/3.0\r\nAccept: application/json, application/octet-stream, */*\r\n";
@@ -3602,14 +4164,17 @@ static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint
             &statusSize,
             WINHTTP_NO_HEADER_INDEX
         );
+        if (outStatus) *outStatus = statusCode;
 
         if (statusCode >= 200 && statusCode < 300) {
+            bool tooLarge = false;
             DWORD dwSize = 0;
             do {
                 if (g_ShuttingDown.load()) { outBody.clear(); break; }
                 dwSize = 0;
                 if (!WinHttpQueryDataAvailable(hRequest, &dwSize)) break;
                 if (dwSize == 0) break;
+                if (outBody.size() + dwSize > maxBytes) { tooLarge = true; outBody.clear(); break; }
 
                 size_t curSize = outBody.size();
                 outBody.resize(curSize + dwSize);
@@ -3621,38 +4186,94 @@ static bool PerformHttpsGetToBuffer(const std::string& fullUrl, std::vector<uint
                     break;
                 }
             } while (dwSize > 0);
-            ok = !outBody.empty();
+            ok = !tooLarge && !outBody.empty();
         }
     }
 
-    WinHttpCloseHandle(hRequest);
+    // Close the request only if the canceller has not already done so.
+    bool alreadyClosed = true;
+    {
+        Win32LockGuard lock(g_HttpActiveMutex);
+        auto it = std::find(g_HttpActiveRequests.begin(), g_HttpActiveRequests.end(), hRequest);
+        if (it != g_HttpActiveRequests.end()) { g_HttpActiveRequests.erase(it); alreadyClosed = false; }
+    }
+    if (!alreadyClosed) WinHttpCloseHandle(hRequest);
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
     return ok;
 }
 
+static void AppendUtf8Codepoint(std::string& out, uint32_t cp) {
+    if (cp < 0x80) out += static_cast<char>(cp);
+    else if (cp < 0x800) { out += static_cast<char>(0xC0 | (cp >> 6)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { out += static_cast<char>(0xE0 | (cp >> 12)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+    else { out += static_cast<char>(0xF0 | (cp >> 18)); out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F)); out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F)); out += static_cast<char>(0x80 | (cp & 0x3F)); }
+}
+
+// Minimal JSON string lookup. The key must really be an object KEY (after '{' or ',' and followed by ':'), so the same
+// text inside another string value is not matched; the value must be a string; escapes (\n \t \" \\ \/ \uXXXX incl.
+// surrogate pairs) are decoded. Returns "" if the key is missing or not a string.
 static std::string ExtractJsonStringField(const std::string& json, const std::string& key, size_t startSearchPos = 0) {
-    std::string pattern = "\"" + key + "\"";
-    size_t pos = json.find(pattern, startSearchPos);
-    if (pos == std::string::npos) return "";
-    pos = json.find(':', pos + pattern.size());
-    if (pos == std::string::npos) return "";
-    pos = json.find('"', pos + 1);
-    if (pos == std::string::npos) return "";
-    size_t endPos = pos + 1;
-    std::string out;
-    while (endPos < json.size()) {
-        if (json[endPos] == '\\' && endPos + 1 < json.size()) {
-            out.push_back(json[endPos + 1]);
-            endPos += 2;
-        } else if (json[endPos] == '"') {
-            break;
-        } else {
-            out.push_back(json[endPos]);
-            endPos++;
+    const std::string pattern = "\"" + key + "\"";
+    size_t pos = startSearchPos;
+    while ((pos = json.find(pattern, pos)) != std::string::npos) {
+        size_t before = pos;
+        while (before > 0 && std::isspace(static_cast<unsigned char>(json[before - 1]))) --before;
+        const bool isKeyPos = (before == 0) || json[before - 1] == '{' || json[before - 1] == ',';
+        size_t v = pos + pattern.size();
+        while (v < json.size() && std::isspace(static_cast<unsigned char>(json[v]))) ++v;
+        if (!isKeyPos || v >= json.size() || json[v] != ':') { pos += pattern.size(); continue; }
+        ++v;
+        while (v < json.size() && std::isspace(static_cast<unsigned char>(json[v]))) ++v;
+        if (v >= json.size() || json[v] != '"') return "";
+        ++v;
+
+        std::string out;
+        while (v < json.size()) {
+            const char c = json[v];
+            if (c == '"') return out;
+            if (c != '\\' || v + 1 >= json.size()) { out.push_back(c); ++v; continue; }
+            const char e = json[v + 1];
+            v += 2;
+            switch (e) {
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                case 'r': out.push_back('\r'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case 'u': {
+                    auto hex4 = [&](size_t at, uint32_t& val) -> bool {
+                        if (at + 4 > json.size()) return false;
+                        val = 0;
+                        for (size_t k = 0; k < 4; ++k) {
+                            const char h = json[at + k];
+                            val <<= 4;
+                            if (h >= '0' && h <= '9') val |= static_cast<uint32_t>(h - '0');
+                            else if (h >= 'a' && h <= 'f') val |= static_cast<uint32_t>(h - 'a' + 10);
+                            else if (h >= 'A' && h <= 'F') val |= static_cast<uint32_t>(h - 'A' + 10);
+                            else return false;
+                        }
+                        return true;
+                    };
+                    uint32_t cp = 0;
+                    if (!hex4(v, cp)) { out.push_back('?'); break; }
+                    v += 4;
+                    if (cp >= 0xD800 && cp <= 0xDBFF && v + 6 <= json.size() && json[v] == '\\' && json[v + 1] == 'u') {
+                        uint32_t lo = 0;
+                        if (hex4(v + 2, lo) && lo >= 0xDC00 && lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            v += 6;
+                        }
+                    }
+                    AppendUtf8Codepoint(out, cp);
+                    break;
+                }
+                default: out.push_back(e); break;   // \" \\ \/ and anything unknown
+            }
         }
+        return out;   // unterminated string
     }
-    return out;
+    return "";
 }
 
 static bool IsMarkerHiddenByAchievement(const RuntimeMarker& m) {
@@ -3672,6 +4293,27 @@ static bool IsMarkerHiddenByAchievement(const RuntimeMarker& m) {
     return m.InvertBehavior ? !isComplete : isComplete;
 }
 
+static void OnWorkerException(const char* what) {
+    g_Gw2ApiFetchInProgress.store(false);
+    g_TacoTaskInProgress.store(false);   // otherwise the buttons stay disabled forever after a failed task
+    const std::string msg = std::string("Background task failed: ") + (what ? what : "unknown error");
+    {
+        Win32LockGuard lock(g_TacoManagerMutex);
+        g_TacoManagerStatusText = msg;
+    }
+    if (g_API && g_API->Log) g_API->Log(LOGL_WARNING, "NexusPathing", msg.c_str());
+}
+
+// Human readable reason for a failed request (the HTTP status used to be thrown away, so a GitHub rate limit looked
+// like "no release asset found").
+static std::string HttpFailText(DWORD status, const std::string& what) {
+    if (status == 0)                       return what + ": no response (offline, blocked by firewall/proxy, or cancelled)";
+    if (status == 401)                     return what + ": rejected (HTTP 401) - invalid or expired key";
+    if (status == 403 || status == 429)    return what + ": denied or rate limited (HTTP " + std::to_string(status) + ") - try again later";
+    if (status == 404)                     return what + ": not found (HTTP 404)";
+    return what + ": HTTP " + std::to_string(status);
+}
+
 static void SyncGw2ApiAchievementsAsync(std::string apiKey) {
     // Trim whitespace
     while (!apiKey.empty() && (apiKey.front() == ' ' || apiKey.front() == '\t' || apiKey.front() == '\r' || apiKey.front() == '\n')) apiKey.erase(0, 1);
@@ -3681,6 +4323,14 @@ static void SyncGw2ApiAchievementsAsync(std::string apiKey) {
         Win32LockGuard lock(g_Gw2ApiMutex);
         g_Gw2ApiStatusText = "Enter a valid Guild Wars 2 API Key first.";
         return;
+    }
+    // GW2 keys are letters, digits and '-' only; anything else is a typo (or an attempt to smuggle header data).
+    for (char c : apiKey) {
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-')) {
+            Win32LockGuard lock(g_Gw2ApiMutex);
+            g_Gw2ApiStatusText = "The API key contains invalid characters (only letters, digits and '-' are allowed).";
+            return;
+        }
     }
 
     bool expected = false;
@@ -3696,15 +4346,21 @@ static void SyncGw2ApiAchievementsAsync(std::string apiKey) {
     SpawnDetachedWin32Thread([apiKey]() {
         std::vector<uint8_t> acctBuf;
         std::string acctName;
-        if (PerformHttpsGetToBuffer("https://api.guildwars2.com/v2/account", acctBuf, apiKey)) {
+        if (PerformHttpsGetToBuffer("https://api.guildwars2.com/v2/account", acctBuf, apiKey, nullptr, 1u << 20)) {
             std::string acctJson(reinterpret_cast<const char*>(acctBuf.data()), acctBuf.size());
             acctName = ExtractJsonStringField(acctJson, "name");
         }
 
         std::vector<uint8_t> achBuf;
-        if (!PerformHttpsGetToBuffer("https://api.guildwars2.com/v2/account/achievements", achBuf, apiKey)) {
+        DWORD achStatus = 0;
+        if (!PerformHttpsGetToBuffer("https://api.guildwars2.com/v2/account/achievements", achBuf, apiKey, &achStatus, 32u << 20)) {
             Win32LockGuard lock(g_Gw2ApiMutex);
-            g_Gw2ApiStatusText = "GW2 API Error: Check key & ensure 'account' + 'progression' permissions are enabled.";
+            if (achStatus == 401 || achStatus == 403) {
+                g_Gw2ApiStatusText = "GW2 API: key rejected or missing permissions (HTTP " + std::to_string(achStatus) +
+                                     "). Enable 'account' + 'progression' for the key.";
+            } else {
+                g_Gw2ApiStatusText = "GW2 API Error: " + HttpFailText(achStatus, "achievements request");
+            }
             g_Gw2ApiFetchInProgress.store(false);
             return;
         }
@@ -3778,6 +4434,18 @@ static void SyncGw2ApiAchievementsAsync(std::string apiKey) {
     });
 }
 
+// "owner/repo": both parts non-empty, only [A-Za-z0-9._-], not "." / "..". (It is pasted into an API URL.)
+static bool IsValidOwnerRepo(const std::string& s) {
+    const size_t slash = s.find('/');
+    if (slash == std::string::npos || slash == 0 || slash + 1 >= s.size() || s.find('/', slash + 1) != std::string::npos) return false;
+    for (char c : s) {
+        if (c == '/') continue;
+        if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '-')) return false;
+    }
+    const std::string owner = s.substr(0, slash), repo = s.substr(slash + 1);
+    return owner != "." && owner != ".." && repo != "." && repo != "..";
+}
+
 static bool ParseGithubOwnerRepoFromUrl(std::string url, std::string& outOwnerRepo, std::string& outDirectDownloadUrl) {
     outOwnerRepo.clear();
     outDirectDownloadUrl.clear();
@@ -3785,17 +4453,32 @@ static bool ParseGithubOwnerRepoFromUrl(std::string url, std::string& outOwnerRe
     while (!url.empty() && (url.back() == ' ' || url.back() == '\t' || url.back() == '\r' || url.back() == '\n' || url.back() == '/')) url.pop_back();
     if (url.empty()) return false;
 
-    std::string low = ToLowerAscii(url);
-    if (low.size() >= 5 && (low.substr(low.size() - 5) == ".taco" || low.substr(low.size() - 4) == ".zip")) {
+    // Query string / fragment must not leak into the repo name ("...?tab=readme"), but a direct download link keeps it.
+    std::string bare = url;
+    const size_t cut = bare.find_first_of("?#");
+    if (cut != std::string::npos) bare.resize(cut);
+    while (!bare.empty() && bare.back() == '/') bare.pop_back();
+
+    const std::string low = ToLowerAscii(bare);
+    if ((low.size() > 5 && low.compare(low.size() - 5, 5, ".taco") == 0) ||
+        (low.size() > 4 && low.compare(low.size() - 4, 4, ".zip") == 0)) {
         outDirectDownloadUrl = url;
     }
 
-    auto ghPos = low.find("github.com/");
+    // Accept github.com only as the HOST ("https://github.com/", "https://www.github.com/", "github.com/"), not as a
+    // substring of some other URL.
     std::string pathPart;
+    const size_t ghPos = low.find("github.com/");
+    bool hostIsGithub = false;
     if (ghPos != std::string::npos) {
-        pathPart = url.substr(ghPos + 11);
-    } else if (url.find("://") == std::string::npos && url.find('/') != std::string::npos) {
-        pathPart = url; // Supports shorthand "owner/repo"
+        const std::string prefix = low.substr(0, ghPos);
+        hostIsGithub = prefix.empty() || prefix == "www." || prefix == "http://" || prefix == "https://" ||
+                       prefix == "http://www." || prefix == "https://www.";
+    }
+    if (hostIsGithub) {
+        pathPart = bare.substr(ghPos + 11);
+    } else if (bare.find("://") == std::string::npos && bare.find('/') != std::string::npos) {
+        pathPart = bare;   // shorthand "owner/repo"
     } else {
         return !outDirectDownloadUrl.empty();
     }
@@ -3809,29 +4492,43 @@ static bool ParseGithubOwnerRepoFromUrl(std::string url, std::string& outOwnerRe
     if (repo.size() > 4 && ToLowerAscii(repo.substr(repo.size() - 4)) == ".git") {
         repo.resize(repo.size() - 4);
     }
-    if (!owner.empty() && !repo.empty()) {
+    if (IsValidOwnerRepo(owner + "/" + repo)) {
         outOwnerRepo = owner + "/" + repo;
         return true;
     }
     return !outDirectDownloadUrl.empty();
 }
 
-static bool QueryGithubLatestReleaseAsset(const std::string& ownerRepo, std::string& outTag, std::string& outAssetName, std::string& outDownloadUrl) {
+static bool QueryGithubLatestReleaseAsset(const std::string& ownerRepo, std::string& outTag, std::string& outAssetName,
+                                          std::string& outDownloadUrl, DWORD* outStatus = nullptr) {
     outTag.clear();
     outAssetName.clear();
     outDownloadUrl.clear();
+    if (outStatus) *outStatus = 0;
+    if (!IsValidOwnerRepo(ownerRepo)) return false;
 
     std::vector<uint8_t> body;
+    DWORD status = 0;
+    bool listMode = false;
     std::string apiUrl = "https://api.github.com/repos/" + ownerRepo + "/releases/latest";
-    if (!PerformHttpsGetToBuffer(apiUrl, body)) {
-        // Fallback to /releases list in case repo uses pre-releases only
+    bool got = PerformHttpsGetToBuffer(apiUrl, body, "", &status, 8u << 20);
+    // /releases/latest is 404 when a repo only has pre-releases: then (and only then) try the list. After a 403/429 a
+    // second request would just burn more of the 60-per-hour anonymous rate limit.
+    if (!got && status != 403 && status != 429) {
+        listMode = true;
         apiUrl = "https://api.github.com/repos/" + ownerRepo + "/releases";
-        if (!PerformHttpsGetToBuffer(apiUrl, body)) {
-            return false;
-        }
+        got = PerformHttpsGetToBuffer(apiUrl, body, "", &status, 8u << 20);
     }
+    if (outStatus) *outStatus = status;
+    if (!got) return false;
 
     std::string json(reinterpret_cast<const char*>(body.data()), body.size());
+    if (listMode) {
+        // Newest release only, so the tag and the asset always belong to the same release.
+        const size_t first = json.find("\"tag_name\"");
+        const size_t second = (first == std::string::npos) ? std::string::npos : json.find("\"tag_name\"", first + 10);
+        if (second != std::string::npos) json.resize(second);
+    }
     outTag = ExtractJsonStringField(json, "tag_name");
     if (outTag.empty()) outTag = "latest";
 
@@ -3869,6 +4566,40 @@ static bool QueryGithubLatestReleaseAsset(const std::string& ownerRepo, std::str
     return false;
 }
 
+static bool IsHttpsUrl(const std::string& u) { return ToLowerAscii(u).rfind("https://", 0) == 0; }
+
+// Validate and install downloaded pack bytes: must be a zip archive, written under a sanitized plain file name,
+// atomically (a crash, full disk or a reader holding the old file can no longer leave a truncated pack behind).
+static bool InstallPackBytes(const std::string& localFile, const std::vector<uint8_t>& bytes, std::filesystem::path& outDest, std::string& err) {
+    if (!LooksLikeZip(bytes)) {
+        err = "the downloaded file is not a .taco/.zip archive (an error page instead of the pack?)";
+        return false;
+    }
+    std::filesystem::path markersDir = GetPrimaryMarkersDirectory();
+    std::error_code ec;
+    std::filesystem::create_directories(markersDir, ec);
+    outDest = markersDir / PathFromUtf8(SanitizePackFileName(localFile));
+    return WriteFileAtomic(outDest, bytes.data(), bytes.size(), err);
+}
+
+// Merge results computed on a snapshot back into the live list by identity. The old code replaced the whole list
+// minutes later, undoing anything the user added/removed in the meantime. Caller holds g_TacoManagerMutex.
+static void MergeRepoResults(const std::vector<ManagedTacoRepo>& snapshot) {
+    for (const auto& s : snapshot) {
+        for (auto& live : g_ManagedTacoRepos) {
+            if (EqualsIgnoreCaseAscii(live.OwnerRepo, s.OwnerRepo) && EqualsIgnoreCaseAscii(live.LocalFilename, s.LocalFilename)) {
+                live.InstalledTag    = s.InstalledTag;
+                live.LatestTag       = s.LatestTag;
+                live.DownloadUrl     = s.DownloadUrl;
+                live.AssetName       = s.AssetName;
+                live.UpdateAvailable = s.UpdateAvailable;
+                live.StatusText      = s.StatusText;
+                break;
+            }
+        }
+    }
+}
+
 // Button 1 Action: Paste & Download GitHub Repo (.taco / .zip)
 static void StartDownloadFromGithubUrlAsync(std::string rawUrl) {
     bool expected = false;
@@ -3882,12 +4613,16 @@ static void StartDownloadFromGithubUrlAsync(std::string rawUrl) {
     }
 
     SpawnDetachedWin32Thread([rawUrl]() {
+        auto fail = [](const std::string& msg) {
+            Win32LockGuard lock(g_TacoManagerMutex);
+            g_TacoManagerStatusText = msg;
+            g_TacoTaskInProgress.store(false);
+        };
+
         std::string ownerRepo;
         std::string directUrl;
         if (!ParseGithubOwnerRepoFromUrl(rawUrl, ownerRepo, directUrl)) {
-            Win32LockGuard lock(g_TacoManagerMutex);
-            g_TacoManagerStatusText = "Invalid URL. Paste a GitHub repo link (e.g. https://github.com/xrandox/TehsTrails) or direct .taco URL.";
-            g_TacoTaskInProgress.store(false);
+            fail("Invalid URL. Paste a GitHub repo link (e.g. https://github.com/xrandox/TehsTrails) or direct .taco URL.");
             return;
         }
 
@@ -3896,24 +4631,30 @@ static void StartDownloadFromGithubUrlAsync(std::string rawUrl) {
         std::string downloadUrl = directUrl;
 
         if (downloadUrl.empty() && !ownerRepo.empty()) {
-            if (!QueryGithubLatestReleaseAsset(ownerRepo, tag, assetName, downloadUrl)) {
-                Win32LockGuard lock(g_TacoManagerMutex);
-                g_TacoManagerStatusText = "No .taco or .zip release asset found in GitHub repo: " + ownerRepo;
-                g_TacoTaskInProgress.store(false);
+            DWORD qStatus = 0;
+            if (!QueryGithubLatestReleaseAsset(ownerRepo, tag, assetName, downloadUrl, &qStatus)) {
+                fail(qStatus == 0 || qStatus >= 400
+                         ? HttpFailText(qStatus, "GitHub release lookup for " + ownerRepo)
+                         : "No .taco or .zip release asset found in GitHub repo: " + ownerRepo);
                 return;
             }
         } else if (!downloadUrl.empty()) {
-            auto slash = downloadUrl.rfind('/');
-            assetName = (slash != std::string::npos) ? downloadUrl.substr(slash + 1) : "downloaded_pack.taco";
+            std::string bare = downloadUrl.substr(0, downloadUrl.find_first_of("?#"));
+            auto slash = bare.rfind('/');
+            assetName = (slash != std::string::npos) ? bare.substr(slash + 1) : "downloaded_pack.taco";
+        }
+        if (!IsHttpsUrl(downloadUrl)) {
+            fail("Only https:// download links are accepted: " + downloadUrl);
+            return;
         }
 
-        std::string localFile = assetName;
+        std::string localFile = SanitizePackFileName(assetName);
         if (!ownerRepo.empty()) {
             std::string safePrefix = ownerRepo;
             std::replace(safePrefix.begin(), safePrefix.end(), '/', '_');
             if (ToLowerAscii(localFile).find(ToLowerAscii(safePrefix)) == std::string::npos &&
                 ToLowerAscii(localFile).find(ToLowerAscii(ownerRepo.substr(ownerRepo.find('/') + 1))) == std::string::npos) {
-                localFile = safePrefix + "_" + assetName;
+                localFile = SanitizePackFileName(safePrefix + "_" + localFile);
             }
         }
 
@@ -3923,27 +4664,17 @@ static void StartDownloadFromGithubUrlAsync(std::string rawUrl) {
         }
 
         std::vector<uint8_t> fileBytes;
-        if (!PerformHttpsGetToBuffer(downloadUrl, fileBytes) || fileBytes.size() < 32) {
-            Win32LockGuard lock(g_TacoManagerMutex);
-            g_TacoManagerStatusText = "Download failed for: " + downloadUrl;
-            g_TacoTaskInProgress.store(false);
+        DWORD dlStatus = 0;
+        if (!PerformHttpsGetToBuffer(downloadUrl, fileBytes, "", &dlStatus, 512u << 20)) {
+            fail(HttpFailText(dlStatus, "Download of " + downloadUrl));
             return;
         }
 
-        std::filesystem::path markersDir = GetPrimaryMarkersDirectory();
-        std::error_code ec;
-        std::filesystem::create_directories(markersDir, ec);
-        std::filesystem::path destPath = markersDir / localFile;
-
-        {
-            std::ofstream ofs(destPath, std::ios::binary | std::ios::trunc);
-            if (!ofs) {
-                Win32LockGuard lock(g_TacoManagerMutex);
-                g_TacoManagerStatusText = "Failed to write file to disk: " + destPath.string();
-                g_TacoTaskInProgress.store(false);
-                return;
-            }
-            ofs.write(reinterpret_cast<const char*>(fileBytes.data()), static_cast<std::streamsize>(fileBytes.size()));
+        std::filesystem::path destPath;
+        std::string installErr;
+        if (!InstallPackBytes(localFile, fileBytes, destPath, installErr)) {
+            fail("Install failed: " + installErr);
+            return;
         }
 
         {
@@ -4009,14 +4740,16 @@ static void StartCheckTacoUpdatesAsync() {
             return;
         }
 
-        size_t updatesFound = 0;
+        size_t updatesFound = 0, failed = 0;
         for (auto& repo : snapshot) {
+            if (g_ShuttingDown.load()) break;
             if (repo.OwnerRepo.empty()) {
-                repo.StatusText = "Direct URL (Ready to re-download)";
+                repo.StatusText = "Direct URL (use 'Update All Files' to re-download and compare)";
                 continue;
             }
             std::string latestTag, assetName, dlUrl;
-            if (QueryGithubLatestReleaseAsset(repo.OwnerRepo, latestTag, assetName, dlUrl)) {
+            DWORD qStatus = 0;
+            if (QueryGithubLatestReleaseAsset(repo.OwnerRepo, latestTag, assetName, dlUrl, &qStatus)) {
                 repo.LatestTag   = latestTag;
                 repo.AssetName   = assetName;
                 repo.DownloadUrl = dlUrl;
@@ -4029,17 +4762,20 @@ static void StartCheckTacoUpdatesAsync() {
                     repo.StatusText      = "Up to date (" + latestTag + ")";
                 }
             } else {
-                repo.StatusText = "Failed to query GitHub API";
+                repo.StatusText = HttpFailText(qStatus, "GitHub release lookup");
+                failed++;
             }
         }
 
         {
             Win32LockGuard lock(g_TacoManagerMutex);
-            g_ManagedTacoRepos = std::move(snapshot);
+            MergeRepoResults(snapshot);
             if (updatesFound > 0) {
                 g_TacoManagerStatusText = "Found " + std::to_string(updatesFound) + " pack update(s)! Click 'Update All Files' to install.";
+            } else if (failed > 0) {
+                g_TacoManagerStatusText = "Could not check " + std::to_string(failed) + " pack(s) (see the status of each entry).";
             } else {
-                g_TacoManagerStatusText = "All " + std::to_string(g_ManagedTacoRepos.size()) + " tracked .taco pack(s) are up to date!";
+                g_TacoManagerStatusText = "All " + std::to_string(snapshot.size()) + " tracked .taco pack(s) are up to date!";
             }
         }
         g_PendingSaveConfigOnMainThread.store(true);
@@ -4072,27 +4808,38 @@ static void StartUpdateAllTacoFilesAsync() {
         std::filesystem::path markersDir = GetPrimaryMarkersDirectory();
         std::error_code ec;
         std::filesystem::create_directories(markersDir, ec);
-        size_t updatedCount = 0;
+        size_t updatedCount = 0, failedCount = 0, unchangedCount = 0;
 
         for (auto& repo : snapshot) {
-            if (!repo.OwnerRepo.empty()) {
+            if (g_ShuttingDown.load()) break;
+            repo.LocalFilename = SanitizePackFileName(repo.LocalFilename);   // never trust a stored path
+            const bool directUrlPack = repo.OwnerRepo.empty();
+            bool queryFailed = false;
+
+            if (!directUrlPack) {
                 std::string latestTag, assetName, dlUrl;
-                if (QueryGithubLatestReleaseAsset(repo.OwnerRepo, latestTag, assetName, dlUrl)) {
+                DWORD qStatus = 0;
+                if (QueryGithubLatestReleaseAsset(repo.OwnerRepo, latestTag, assetName, dlUrl, &qStatus)) {
                     repo.LatestTag       = latestTag;
                     repo.AssetName       = assetName;
                     repo.DownloadUrl     = dlUrl;
                     repo.UpdateAvailable = (repo.InstalledTag != latestTag);
+                } else {
+                    queryFailed = true;
+                    failedCount++;
+                    repo.StatusText = HttpFailText(qStatus, "GitHub release lookup");
                 }
             }
 
-            std::filesystem::path destPath = markersDir / repo.LocalFilename;
-            bool fileExists = std::filesystem::exists(destPath, ec);
-            if (!repo.UpdateAvailable && fileExists && !repo.InstalledTag.empty()) {
-                repo.StatusText = "Up to date (" + repo.InstalledTag + ")";
+            std::filesystem::path destPath = markersDir / PathFromUtf8(repo.LocalFilename);
+            const bool fileExists = std::filesystem::exists(destPath, ec);
+            if (!directUrlPack && !repo.UpdateAvailable && fileExists && !repo.InstalledTag.empty()) {
+                if (!queryFailed) { repo.StatusText = "Up to date (" + repo.InstalledTag + ")"; unchangedCount++; }
                 continue;
             }
-
+            if (queryFailed && fileExists) continue;       // cannot tell whether a newer release exists: keep the current file
             if (repo.DownloadUrl.empty()) continue;
+            if (!IsHttpsUrl(repo.DownloadUrl)) { repo.StatusText = "Skipped: only https:// links are allowed"; failedCount++; continue; }
 
             {
                 Win32LockGuard lock(g_TacoManagerMutex);
@@ -4100,26 +4847,38 @@ static void StartUpdateAllTacoFilesAsync() {
             }
 
             std::vector<uint8_t> fileBytes;
-            if (PerformHttpsGetToBuffer(repo.DownloadUrl, fileBytes) && fileBytes.size() >= 32) {
-                std::ofstream ofs(destPath, std::ios::binary | std::ios::trunc);
-                if (ofs) {
-                    ofs.write(reinterpret_cast<const char*>(fileBytes.data()), static_cast<std::streamsize>(fileBytes.size()));
-                    ofs.close();
-                    repo.InstalledTag    = repo.LatestTag.empty() ? "latest" : repo.LatestTag;
-                    repo.UpdateAvailable = false;
-                    repo.StatusText      = "Updated (" + repo.InstalledTag + ", " + std::to_string(fileBytes.size() / 1024) + " KB)";
-                    updatedCount++;
-                }
-            } else {
-                repo.StatusText = "Download error";
+            DWORD dlStatus = 0;
+            if (!PerformHttpsGetToBuffer(repo.DownloadUrl, fileBytes, "", &dlStatus, 512u << 20)) {
+                repo.StatusText = HttpFailText(dlStatus, "Download");
+                failedCount++;
+                continue;
             }
+            if (directUrlPack && FileHasSameContent(destPath, fileBytes)) {      // direct links have no tag: compare content
+                repo.StatusText = "Up to date (identical file)";
+                unchangedCount++;
+                continue;
+            }
+            std::filesystem::path writtenTo;
+            std::string installErr;
+            if (!InstallPackBytes(repo.LocalFilename, fileBytes, writtenTo, installErr)) {
+                repo.StatusText = "Update failed: " + installErr;
+                failedCount++;
+                continue;
+            }
+            repo.InstalledTag    = repo.LatestTag.empty() ? "latest" : repo.LatestTag;
+            repo.UpdateAvailable = false;
+            repo.StatusText      = "Updated (" + repo.InstalledTag + ", " + std::to_string(fileBytes.size() / 1024) + " KB)";
+            updatedCount++;
         }
 
         {
             Win32LockGuard lock(g_TacoManagerMutex);
-            g_ManagedTacoRepos = std::move(snapshot);
+            MergeRepoResults(snapshot);
             if (updatedCount > 0) {
-                g_TacoManagerStatusText = "Successfully updated " + std::to_string(updatedCount) + " .taco pack(s)! Reloading...";
+                g_TacoManagerStatusText = "Successfully updated " + std::to_string(updatedCount) + " .taco pack(s)" +
+                                          (failedCount ? (", " + std::to_string(failedCount) + " failed") : std::string()) + "! Reloading...";
+            } else if (failedCount > 0) {
+                g_TacoManagerStatusText = "Nothing updated: " + std::to_string(failedCount) + " pack(s) could not be checked or downloaded (see each entry).";
             } else {
                 g_TacoManagerStatusText = "All tracked .taco files are already on the latest version.";
             }
@@ -4135,8 +4894,7 @@ static void StartUpdateAllTacoFilesAsync() {
 
 static void SaveConfigToDisk() {
     std::filesystem::path cfgPath = GetConfigFilePath();
-    std::ofstream ofs(cfgPath, std::ios::trunc);
-    if (!ofs) return;
+    std::ostringstream ofs;   // built in memory, then written atomically (temp file + rename)
 
     ofs << "# NexusPathing Persistent Configuration File\n";
     ofs << "[Settings]\n";
@@ -4152,7 +4910,16 @@ static void SaveConfigToDisk() {
     ofs << "TrailOpacity=" << g_TrailOpacity << "\n";
     ofs << "MaxTrailDistance=" << g_MaxTrailDistance << "\n";
     ofs << "HideCompletedAchPois=" << (g_HideCompletedAchPois ? 1 : 0) << "\n";
-    ofs << "Gw2ApiKey=" << g_Gw2ApiKeyBuf << "\n\n";
+    {
+        std::string keyHex;
+        if (g_Gw2ApiKeyBuf[0] && ProtectSecretToHex(g_Gw2ApiKeyBuf, keyHex)) {
+            ofs << "Gw2ApiKeyEnc=" << keyHex << "\n\n";     // DPAPI-protected, readable only by this Windows user
+        } else if (g_Gw2ApiKeyBuf[0]) {
+            ofs << "Gw2ApiKey=" << g_Gw2ApiKeyBuf << "\n\n";  // DPAPI unavailable: keep the key rather than lose it
+        } else {
+            ofs << "\n";
+        }
+    }
 
     ofs << "[Packs]\n";
     for (const auto& [packKey, en] : g_SavedPackStates) {
@@ -4172,10 +4939,15 @@ static void SaveConfigToDisk() {
     }
     ofs << "\n[LuaStorage]\n";
     for (const auto& [k, v] : g_LuaStorageKV) {
-        std::string cleanV = v;
-        std::replace(cleanV.begin(), cleanV.end(), '\n', ' ');
-        std::replace(cleanV.begin(), cleanV.end(), '\r', ' ');
-        ofs << k << "=" << cleanV << "\n";
+        if (!IsSafeConfigToken(k)) continue;                         // never write a key that could break the file format
+        ofs << k << "=np1:" << EscapeConfigValue(v) << "\n";         // newlines / backslashes survive a round trip
+    }
+
+    const std::string data = ofs.str();
+    std::string err;
+    if (!WriteFileAtomic(cfgPath, data.data(), data.size(), err) && g_API && g_API->Log) {
+        const std::string msg = "Could not save config.ini: " + err;
+        g_API->Log(LOGL_WARNING, "NexusPathing", msg.c_str());
     }
 }
 
@@ -4222,8 +4994,12 @@ static void LoadConfigFromDisk() {
             else if (k == "trailtransparency") g_TrailOpacity = 1.0f - std::clamp(SafeParseFloat(val, 0.0f), 0.0f, 1.0f);
             else if (k == "maxtraildistance") g_MaxTrailDistance = std::clamp(SafeParseFloat(val, 500.0f), 50.0f, 2500.0f);
             else if (k == "hidecompletedachpois") g_HideCompletedAchPois = SafeParseBool(val, true);
-            else if (k == "gw2apikey") {
+            else if (k == "gw2apikey") {                       // legacy plain-text value (re-saved encrypted)
                 std::snprintf(g_Gw2ApiKeyBuf, sizeof(g_Gw2ApiKeyBuf), "%s", val.c_str());
+            }
+            else if (k == "gw2apikeyenc") {
+                std::string plain;
+                if (UnprotectSecretFromHex(val, plain)) std::snprintf(g_Gw2ApiKeyBuf, sizeof(g_Gw2ApiKeyBuf), "%s", plain.c_str());
             }
         } else if (section == "packs") {
             g_SavedPackStates[ToLowerAscii(key)] = SafeParseBool(val, true);
@@ -4245,14 +5021,17 @@ static void LoadConfigFromDisk() {
                 ManagedTacoRepo r{};
                 r.RepoUrl       = parts[0];
                 r.OwnerRepo     = parts[1];
-                r.LocalFilename = parts[2];
+                r.LocalFilename = SanitizePackFileName(parts[2]);   // plain file name only: no folders, no '..', no drive paths
                 r.InstalledTag  = (parts.size() >= 4) ? parts[3] : "";
                 r.LatestTag     = r.InstalledTag;
                 r.DownloadUrl   = (parts.size() >= 5) ? parts[4] : "";
+                if (!r.DownloadUrl.empty() && ToLowerAscii(r.DownloadUrl).rfind("https://", 0) != 0) r.DownloadUrl.clear();
                 r.StatusText    = r.InstalledTag.empty() ? "Installed" : ("Installed (" + r.InstalledTag + ")");
                 loadedRepos.push_back(std::move(r));
             }
         } else if (section == "luastorage") {
+            if (!IsSafeConfigToken(key)) continue;
+            if (val.rfind("np1:", 0) == 0) val = UnescapeConfigValue(val.substr(4));
             g_LuaStorageKV[key] = val;
         }
     }
@@ -4289,12 +5068,12 @@ static void DiscoverAllMarkerPacks() {
     // FIX 2: markers/trails (which hold raw NativeSRV pointers) are gone, so the texture cache can be
     // dropped safely. This frees textures of removed packs and lets updated .taco files reload their images.
     g_UploadedTextureIds.clear();
+    g_MissingTextureIds.clear();
     g_D3DEngine.ClearTextureCache();
     g_LoadedPacks.clear();
     g_ScannedDirectories.clear();
     g_LuaScriptsInPack.clear();
     g_PackEntryLuaScripts.clear();
-    g_PackBinaryFiles.clear();
     g_LastKnownMapId = g_Mumble ? static_cast<int32_t>(g_Mumble->Context.MapID) : -1;
 
     InitLuaVM();
@@ -4313,6 +5092,7 @@ static void DiscoverAllMarkerPacks() {
     }
 
     std::unordered_set<std::string> visitedFiles;
+    std::unordered_set<std::string> loadedNames;   // the same pack in two scanned folders must not load twice
 
     for (const auto& dir : candidateDirs) {
         std::error_code ec;
@@ -4321,42 +5101,59 @@ static void DiscoverAllMarkerPacks() {
         }
         if (!std::filesystem::exists(dir, ec)) continue;
 
-        g_ScannedDirectories.push_back(dir.string());
+        g_ScannedDirectories.push_back(PathToUtf8(dir));
 
-        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
-            if (!entry.is_regular_file(ec)) continue;
+        // Non-throwing iteration: a file that disappears or is locked mid-scan (downloads, antivirus) must not throw
+        // out of a render callback.
+        std::filesystem::directory_iterator dirIt(dir, ec);
+        const std::filesystem::directory_iterator dirEnd;
+        for (; !ec && dirIt != dirEnd; dirIt.increment(ec)) {
+            const auto& entry = *dirIt;
+            std::error_code entryEc;
+            if (!entry.is_regular_file(entryEc)) continue;
 
             std::string canonicalPath = ToLowerAscii(entry.path().string());
             if (visitedFiles.count(canonicalPath)) continue;
             visitedFiles.insert(canonicalPath);
 
-            std::string ext = ToLowerAscii(entry.path().extension().string());
+            std::string ext = ToLowerAscii(PathToUtf8(entry.path().extension()));
+            if (ext == ".taco" || ext == ".zip" || ext == ".xml" || ext == ".trl") {
+                const std::string nameKey = ToLowerAscii(PathToUtf8(entry.path().filename()));
+                if (!loadedNames.insert(nameKey).second) {
+                    if (g_API && g_API->Log) {
+                        const std::string msg = "Skipping duplicate pack file (already loaded from another folder): " + PathToUtf8(entry.path());
+                        g_API->Log(LOGL_INFO, "NexusPathing", msg.c_str());
+                    }
+                    continue;
+                }
+            }
             if (ext == ".taco" || ext == ".zip") {
                 LoadTacoZipArchive(entry.path());
             } else if (ext == ".xml") {
                 std::ifstream ifs(entry.path(), std::ios::binary | std::ios::ate);
                 if (!ifs) continue;
                 auto sz = ifs.tellg();
-                if (sz <= 0) continue;
+                if (sz <= 0 || static_cast<size_t>(sz) > kMaxXmlBytes) continue;
                 std::vector<char> xmlBuf(static_cast<size_t>(sz));
                 ifs.seekg(0);
                 ifs.read(xmlBuf.data(), sz);
 
                 LoadedPackSummary summary{};
-                summary.Filename = entry.path().filename().string();
-                summary.FullPath = entry.path().string();
+                summary.Filename = PathToUtf8(entry.path().filename());
+                summary.FullPath = PathToUtf8(entry.path());
 
                 std::filesystem::path baseDir = entry.path().parent_path();
                 auto fetchLooseFile = [&](const std::string& relPath, std::vector<uint8_t>& outBytes) -> bool {
-                    std::filesystem::path fullPath = baseDir / relPath;
+                    // normalized relative path: cannot contain ".." or a drive letter, so it cannot leave baseDir
+                    std::filesystem::path fullPath = baseDir / PathFromUtf8(NormalizeArchivePath(relPath));
                     std::ifstream tfs(fullPath, std::ios::binary | std::ios::ate);
                     if (!tfs) return false;
                     auto tsz = tfs.tellg();
-                    if (tsz <= 0) return false;
+                    if (tsz <= 0 || static_cast<size_t>(tsz) > kMaxImageBytes) return false;
                     outBytes.resize(static_cast<size_t>(tsz));
                     tfs.seekg(0);
                     tfs.read(reinterpret_cast<char*>(outBytes.data()), tsz);
-                    return true;
+                    return tfs.gcount() == tsz;
                 };
 
                 ParseOverlayXmlDocument(xmlBuf.data(), xmlBuf.size(), summary.Filename, fetchLooseFile, summary);
@@ -4365,22 +5162,22 @@ static void DiscoverAllMarkerPacks() {
                 std::ifstream ifs(entry.path(), std::ios::binary | std::ios::ate);
                 if (!ifs) continue;
                 auto sz = ifs.tellg();
-                if (sz <= 8) continue;
+                if (sz <= 8 || static_cast<size_t>(sz) > kMaxTrlBytes) continue;
                 std::vector<uint8_t> buf(static_cast<size_t>(sz));
                 ifs.seekg(0);
                 ifs.read(reinterpret_cast<char*>(buf.data()), sz);
 
                 RuntimeTrail trail{};
-                trail.PackName      = entry.path().filename().string();
-                trail.Guid          = entry.path().filename().string();
-                trail.TrailDataPath = entry.path().filename().string();
+                trail.PackName      = PathToUtf8(entry.path().filename());
+                trail.Guid          = PathToUtf8(entry.path().filename());
+                trail.TrailDataPath = PathToUtf8(entry.path().filename());
                 if (ParseTrlBinaryBuffer(buf.data(), buf.size(), trail.MapId, trail.Segments)) {
                     g_D3DEngine.PrecomputeTrailCornerRights(trail);
                     g_Trails.push_back(std::move(trail));
 
                     LoadedPackSummary summary{};
-                    summary.Filename   = entry.path().filename().string();
-                    summary.FullPath   = entry.path().string();
+                    summary.Filename   = PathToUtf8(entry.path().filename());
+                    summary.FullPath   = PathToUtf8(entry.path());
                     summary.TrailCount = 1;
                     g_LoadedPacks.push_back(std::move(summary));
                 }
@@ -4638,7 +5435,7 @@ static std::string ReadStringFromClipboard() {
     return out;
 }
 
-static void OnInteractKeybind(const char* aIdentifier, bool aIsRelease) {
+static void OnInteractKeybindImpl(const char* aIdentifier, bool aIsRelease) {
     if (aIsRelease || !aIdentifier) return;
 
     if (std::strcmp(aIdentifier, "KB_NEXUSPATHING_TOGGLE_UI") == 0) {
@@ -4664,18 +5461,36 @@ static void OnInteractKeybind(const char* aIdentifier, bool aIsRelease) {
     }
 }
 
+// Pack:CreateMarker() appends to g_Markers. Re-running pack.lua on every map change (after InitLuaVM wiped the
+// VM) therefore ADDED another full copy of every script-created marker each time: unbounded growth of g_Markers,
+// duplicated rendering/trigger work and an ever-longer linear scan in Lua_World_MarkerByGuid.
+// The VM is rebuilt right before this runs, so no Lua table can still hold an index into g_Markers.
+static void PurgeLuaCreatedMarkers() {
+    const size_t before = g_Markers.size();
+    g_Markers.erase(std::remove_if(g_Markers.begin(), g_Markers.end(),
+                                   [](const RuntimeMarker& m) { return m.FromLua; }),
+                    g_Markers.end());
+    if (g_Markers.size() != before) g_CategoryCountsCacheDirty = true;
+}
+
 static void ReExecuteAllPackScriptsForCurrentMap() {
     if (g_PackEntryLuaScripts.empty()) return;
     InitLuaVM();
-    for (const auto& [packName, packLua] : g_PackEntryLuaScripts) {
+    if (!g_Lua) return;
+    PurgeLuaCreatedMarkers();
+    for (const auto& [packName, scriptKey] : g_PackEntryLuaScripts) {
+        auto scriptIt = g_LuaScriptsInPack.find(scriptKey);
+        if (scriptIt == g_LuaScriptsInPack.end()) continue;
+        const std::string& packLua = scriptIt->second;
         if (!IsPackEnabled(packName)) continue;
         g_CurrentPackName = packName;
-        if (luaL_loadbuffer(g_Lua, packLua.data(), packLua.size(), (packName + ":pack.lua").c_str()) == LUA_OK) {
-            if (lua_pcall(g_Lua, 0, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("pack.lua runtime error: ") + lua_tostring(g_Lua, -1), LOGL_WARNING);
+        if (LuaLoadText(g_Lua, packLua, packName + ":pack.lua") == LUA_OK) {
+            if (LuaSafeCall(g_Lua, 0, 0) != LUA_OK) {
+                PushLuaLog("pack.lua runtime error: " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             }
         } else {
+            PushLuaLog("pack.lua load error: " + LuaErrStr(g_Lua), LOGL_WARNING);
             lua_pop(g_Lua, 1);
         }
     }
@@ -4737,7 +5552,7 @@ static void RegisterQuickAccessTextures() {
     }
 }
 
-static void OnPreRender() {
+static void OnPreRenderImpl() {
     if (g_PendingSaveConfigOnMainThread.exchange(false)) {
         SaveConfigToDisk();
     }
@@ -4833,8 +5648,8 @@ static void RenderLuaMenuNodeImGui(LuaMenuNode& node) {
         lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, node.CallbackRef);
         if (lua_isfunction(g_Lua, -1)) {
             lua_rawgeti(g_Lua, LUA_REGISTRYINDEX, node.LuaTableRef);
-            if (lua_pcall(g_Lua, 1, 0, 0) != LUA_OK) {
-                PushLuaLog(std::string("Menu callback error (") + node.Name + "): " + lua_tostring(g_Lua, -1), LOGL_WARNING);
+            if (LuaSafeCall(g_Lua, 1, 0) != LUA_OK) {
+                PushLuaLog("Menu callback error (" + node.Name + "): " + LuaErrStr(g_Lua), LOGL_WARNING);
                 lua_pop(g_Lua, 1);
             }
             SaveConfigToDisk();
@@ -5218,7 +6033,42 @@ static void RenderOptionsContent() {
     }
 }
 
-static void OnRender() {
+// Drops every raw texture pointer held by markers/trails (used when the D3D11 device changed).
+static void ResetAllTextureReferences() {
+    for (auto& m : g_Markers) { m.NativeSRV = nullptr; m.CachedTexture = nullptr; m.IconTextureId.clear(); m.TexRetryAtMs = 0; }
+    for (auto& t : g_Trails)  { t.NativeSRV = nullptr; t.CachedTexture = nullptr; t.TextureId.clear();     t.TexRetryAtMs = 0; }
+    g_UploadedTextureIds.clear();
+    g_MissingTextureIds.clear();
+}
+
+// The engine used to be initialised exactly once at load: if the swap chain was not ready then, or the device was
+// recreated later, nothing was ever drawn again. Retry (throttled) and rebuild on device change.
+static void EnsureD3DEngine() {
+    if (!g_API || !g_API->SwapChain) return;
+    static uint64_t s_LastCheck = 0;
+    static int s_Failures = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - s_LastCheck < (s_Failures > 5 ? 30000u : 1000u)) return;
+    s_LastCheck = now;
+
+    auto* sc = static_cast<IDXGISwapChain*>(g_API->SwapChain);
+    if (!g_D3DEngine.IsInitialized()) {
+        s_Failures = g_D3DEngine.Initialize(sc, g_API) ? 0 : s_Failures + 1;
+    } else if (g_D3DEngine.DeviceDiffers(sc)) {
+        ResetAllTextureReferences();
+        g_D3DEngine.Shutdown();
+        s_Failures = g_D3DEngine.Initialize(sc, g_API) ? 0 : 1;
+    }
+}
+
+struct TextureBudgetScope {   // first-use texture loads are limited per rendered frame
+    TextureBudgetScope()  { g_TextureBudgetActive = true; g_TextureLoadsThisFrame = 0; }
+    ~TextureBudgetScope() { g_TextureBudgetActive = false; }
+};
+
+static void OnRenderImpl() {
+    TextureBudgetScope textureBudget;
+    EnsureD3DEngine();
     if (g_Mumble && (!g_NexusLink || g_NexusLink->IsGameplay)) {
         float fov = (g_MumbleIdentity && g_MumbleIdentity->FOV > 0.1f) ? g_MumbleIdentity->FOV : 0.872665f;
         float uiScale = (g_NexusLink && g_NexusLink->Scaling > 0.2f) ? g_NexusLink->Scaling : 1.0f;
@@ -5256,13 +6106,35 @@ static void OnRender() {
     }
 }
 
-static void OnOptionsRender() {
+static void OnOptionsRenderImpl() {
     RenderOptionsContent();
+}
+
+// Exception firewall: Nexus calls these from the render thread. An exception escaping into it (bad_alloc,
+// filesystem_error, ...) would take the whole game down, so every entry point catches, logs (throttled) and carries on.
+static void LogCallbackException(const char* where, const char* what) {
+    static uint64_t s_LastLog = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - s_LastLog < 5000) return;
+    s_LastLog = now;
+    if (g_API && g_API->Log) {
+        const std::string msg = std::string("Exception in ") + where + ": " + (what ? what : "unknown");
+        g_API->Log(LOGL_CRITICAL, "NexusPathing", msg.c_str());
+    }
+}
+static void OnPreRender()    { try { OnPreRenderImpl(); }    catch (const std::exception& e) { LogCallbackException("OnPreRender", e.what()); }    catch (...) { LogCallbackException("OnPreRender", nullptr); } }
+static void OnRender()       { try { OnRenderImpl(); }       catch (const std::exception& e) { LogCallbackException("OnRender", e.what()); }       catch (...) { LogCallbackException("OnRender", nullptr); } }
+static void OnOptionsRender(){ try { OnOptionsRenderImpl(); } catch (const std::exception& e) { LogCallbackException("OnOptionsRender", e.what()); } catch (...) { LogCallbackException("OnOptionsRender", nullptr); } }
+static void OnInteractKeybind(const char* aIdentifier, bool aIsRelease) {
+    try { OnInteractKeybindImpl(aIdentifier, aIsRelease); }
+    catch (const std::exception& e) { LogCallbackException("OnInteractKeybind", e.what()); }
+    catch (...) { LogCallbackException("OnInteractKeybind", nullptr); }
 }
 
 static void AddonLoad(AddonAPI_t* aApi) {
     g_API = aApi;
     if (!g_API) return;
+    g_ShuttingDown.store(false);   // (reset here, not at the end of AddonUnload, so late workers keep seeing "shutting down")
 
     if (g_API->ImguiContext) {
         ImGui::SetCurrentContext(static_cast<ImGuiContext*>(g_API->ImguiContext));
@@ -5322,9 +6194,11 @@ static void AddonUnload() {
 
     // FIX 4: stop new worker threads and wait (bounded) for in-flight ones before tearing anything down.
     g_ShuttingDown.store(true);
-    for (int waitedMs = 0; g_ActiveWorkerThreads.load() > 0 && waitedMs < 8000; waitedMs += 10) {
+    CancelActiveHttpRequests();      // abort blocking downloads immediately instead of waiting out the network timeout
+    for (int waitedMs = 0; g_ActiveWorkerThreads.load() > 0 && waitedMs < 3000; waitedMs += 10) {
         Sleep(10);
     }
+    CancelActiveHttpRequests();      // a worker may have registered a request just before the flag was set
 
     if (g_API->GUI_Deregister) {
         g_API->GUI_Deregister(OnPreRender);
@@ -5362,10 +6236,10 @@ static void AddonUnload() {
     g_ScannedDirectories.clear();
     g_TriggeredTimestamps.clear();
     g_UploadedTextureIds.clear();
+    g_MissingTextureIds.clear();
     g_LuaTickRefs.clear();
     g_LuaScriptsInPack.clear();
     g_PackEntryLuaScripts.clear();
-    g_PackBinaryFiles.clear();
     g_LuaConsoleLogs.clear();
     {
         Win32LockGuard lock(g_Gw2ApiMutex);
@@ -5373,7 +6247,6 @@ static void AddonUnload() {
         g_AchievementBits.clear();
     }
     g_D3DEngine.Shutdown();   // also clears the native texture cache (FIX 1)
-    g_ShuttingDown.store(false);
 }
 
 } // namespace NexusPathing
